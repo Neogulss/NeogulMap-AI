@@ -2,8 +2,10 @@ import os
 import re
 import json
 import math
+import logging
+from threading import Lock
 from pathlib import Path
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 from collections import OrderedDict
 
 import pickle
@@ -16,40 +18,6 @@ import pymysql
 from dotenv import load_dotenv
 from openai import OpenAI
 from tqdm import tqdm
-
-import re
-from pathlib import Path
-
-# =========================
-# 질문 라우팅 함수
-# =========================
-SERVICE_INTRO_KEYWORDS = [
-    "서비스 소개", "서비스 설명", "서비스설명", "입지너구리 소개", "입지너구리 설명",
-    "입지너구리가 뭐야", "입지너구리 뭐야", "입지너구리란", "이 서비스가 뭐야",
-    "무슨 서비스", "어떤 서비스", "무슨 기능", "주요 기능", "기능 소개",
-    "누구를 위한 서비스", "타겟 사용자", "사용 방법", "어떻게 사용", "플랫폼 소개"
-]
-
-POLICY_LOAN_KEYWORDS = [
-    "정부지원", "지원정책", "정부지원정책", "보조금", "지원금", "창업지원",
-    "소상공인 지원", "대출", "창업대출", "소상공인 대출", "정책자금",
-    "신용보증", "보증", "사업자대출", "융자", "이차보전", "상환", "금리", "지원"
-]
-
-def classify_query(query: str) -> str:
-    q = query.strip().lower()
-
-    # 서비스 소개 우선
-    for keyword in SERVICE_INTRO_KEYWORDS:
-        if keyword.lower() in q:
-            return "service_intro"
-
-    # 정책/대출 관련
-    for keyword in POLICY_LOAN_KEYWORDS:
-        if keyword.lower() in q:
-            return "policy_or_loan"
-
-    return "unsupported"
 
 
 # =========================
@@ -90,7 +58,13 @@ def load_service_intro_document(data_dir: str) -> dict | None:
 # =========================
 load_dotenv()
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+
 CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-5.4-mini")
+RERANK_MODEL = os.getenv("RERANK_MODEL", "BAAI/bge-reranker-v2-m3")
 
 MYSQL_HOST = os.getenv("MYSQL_HOST")
 MYSQL_PORT = int(os.getenv("MYSQL_PORT", "3306"))
@@ -106,6 +80,91 @@ DATA_DIR = os.getenv("DATA_DIR", "./original_data")
 INDEX_DIR = os.getenv("INDEX_DIR", "./vector_data")
 
 os.makedirs(INDEX_DIR, exist_ok=True)
+
+# =========================
+# 전역 싱글톤 객체
+# =========================
+_OPENAI_CLIENT = OpenAI()
+_RERANKER = None
+_RERANKER_LOCK = Lock()
+
+def get_openai_client() -> OpenAI:
+    return _OPENAI_CLIENT
+
+def get_reranker() -> "Reranker":
+    global _RERANKER
+    
+    if _RERANKER is None:
+        with _RERANKER_LOCK:
+            if _RERANKER is None:
+                logging.info(f"[INIT] Reranker loading: {RERANK_MODEL}")
+                _RERANKER = Reranker(RERANK_MODEL)
+                logging.info("[INIT] Reranker loaded successfully")
+    return _RERANKER
+
+
+# =========================
+# 질문 라우팅 함수 (LLM 기반)
+# =========================
+def safe_json_loads(text: str) -> dict:
+    text = text.strip()
+
+    # ```json ... ``` 제거
+    text = re.sub(r"^```json\s*", "", text)
+    text = re.sub(r"^```\s*", "", text)
+    text = re.sub(r"\s*```$", "", text)
+
+    start = text.find("{")
+    end = text.rfind("}")
+
+    if start == -1 or end == -1 or end < start:
+        raise ValueError("JSON 객체를 찾을 수 없습니다.")
+
+    return json.loads(text[start:end + 1])
+
+
+def classify_query(query: str, model: str = CHAT_MODEL) -> str:
+    prompt = f"""
+너는 사용자의 질문을 아래 3가지 중 하나로만 분류하는 라우터다.
+
+분류 가능한 라벨:
+1. service_intro
+   - 입지너구리 서비스 자체의 소개, 목적, 기능, 사용법, 대상 사용자, 플랫폼 설명
+2. policy_or_loan
+   - 정부지원정책, 보조금, 지원금, 창업지원, 소상공인 지원, 대출, 정책자금, 보증, 금리, 상환, 한도 등
+3. unsupported
+   - 위 두 범주와 무관한 질문
+
+반드시 아래 JSON 형식으로만 답하라.
+{{
+  "label": "service_intro | policy_or_loan | unsupported",
+  "reason": "짧은 판단 이유"
+}}
+
+[사용자 질문]
+{query}
+""".strip()
+
+    try:
+        client = get_openai_client()
+        response = client.responses.create(
+            model=model,
+            input=prompt
+        )
+        output = response.output_text.strip()
+        parsed = safe_json_loads(output)
+
+        label = parsed.get("label", "").strip()
+        if label not in {"service_intro", "policy_or_loan", "unsupported"}:
+            raise ValueError(f"허용되지 않은 label: {label}")
+
+        return label
+
+    except Exception as e:
+        logging.exception(f"[ERROR] classify_query 실패: {e}")
+        return "unsupported"
+
+
 
 
 # =========================
@@ -385,7 +444,7 @@ def upsert_document_and_chunks(conn, title: str, file_path: Path, chunks: List[D
 # =========================
 class Embedder:
     def __init__(self, model_name: str):
-        self.client = OpenAI()
+        self.client = get_openai_client()
         self.model_name = model_name
 
     def embed_texts(self, texts, batch_size=100):
@@ -425,6 +484,15 @@ def normalize(vectors: np.ndarray) -> np.ndarray:
     return vectors / norms
 
 
+# 예외 처리를 위한 헬퍼
+def build_error_response(message: str) -> dict:
+    return {
+        "type": "error",
+        "answer": message,
+        "results": []
+    }
+
+
 # =========================
 # FAISS 인덱스
 # =========================
@@ -442,9 +510,19 @@ def save_faiss_index(index: faiss.Index, id_map: List[int], index_dir: str):
 
 
 def load_faiss_index(index_dir: str) -> Tuple[faiss.Index, List[int]]:
-    index = faiss.read_index(os.path.join(index_dir, "faiss.index"))
-    with open(os.path.join(index_dir, "id_map.json"), "r", encoding="utf-8") as f:
+    faiss_path = os.path.join(index_dir, "faiss.index")
+    id_map_path = os.path.join(index_dir, "id_map.json")
+
+    if not os.path.exists(faiss_path):
+        raise FileNotFoundError(f"FAISS 인덱스 파일이 없습니다: {faiss_path}")
+
+    if not os.path.exists(id_map_path):
+        raise FileNotFoundError(f"id_map 파일이 없습니다: {id_map_path}")
+
+    index = faiss.read_index(faiss_path)
+    with open(id_map_path, "r", encoding="utf-8") as f:
         id_map = json.load(f)
+
     return index, id_map
 
 
@@ -485,8 +563,14 @@ def save_bm25_index(bm25, bm25_docs, index_dir: str):
 
 
 def load_bm25_index(index_dir: str):
-    with open(os.path.join(index_dir, "bm25.pkl"), "rb") as f:
+    bm25_path = os.path.join(index_dir, "bm25.pkl")
+
+    if not os.path.exists(bm25_path):
+        raise FileNotFoundError(f"BM25 인덱스 파일이 없습니다: {bm25_path}")
+
+    with open(bm25_path, "rb") as f:
         data = pickle.load(f)
+
     return data["bm25"], data["docs"]
 
 
@@ -507,35 +591,44 @@ def index_markdown_files(data_dir: str):
     all_chunk_ids = []
     all_bm25_docs = []
 
-    conn = get_connection()
+    conn = None
     try:
+        conn = get_connection()
+
         for file_path in tqdm(md_files, desc="Indexing markdown files"):
-            title, chunks = build_chunks_from_markdown(file_path)
+            try:
+                title, chunks = build_chunks_from_markdown(file_path)
 
-            if not chunks:
-                print(f"[WARN] chunk가 생성되지 않았습니다: {file_path}")
+                if not chunks:
+                    logging.warning(f"[WARN] chunk가 생성되지 않았습니다: {file_path}")
+                    continue
+
+                document_id, chunk_ids = upsert_document_and_chunks(conn, title, file_path, chunks)
+
+                texts = [chunk["content"] for chunk in chunks]
+                vectors = embedder.embed_texts(texts)
+                vectors = normalize(vectors)
+
+                all_vectors.append(vectors)
+                all_chunk_ids.extend(chunk_ids)
+
+                for chunk_id, chunk in zip(chunk_ids, chunks):
+                    all_bm25_docs.append({
+                        "chunk_id": chunk_id,
+                        "document_id": document_id,
+                        "title": chunk["title"],
+                        "file_name": chunk["file_name"],
+                        "section": chunk["section"],
+                        "parent_h1": chunk.get("parent_h1"),
+                        "parent_h2": chunk.get("parent_h2"),
+                        "content": chunk["content"],
+                    })
+
+            except Exception as file_error:
+                logging.exception(f"[ERROR] 파일 인덱싱 실패: {file_path} / {file_error}")
+                if conn:
+                    conn.rollback()
                 continue
-
-            document_id, chunk_ids = upsert_document_and_chunks(conn, title, file_path, chunks)
-
-            texts = [chunk["content"] for chunk in chunks]
-            vectors = embedder.embed_texts(texts)
-            vectors = normalize(vectors)
-
-            all_vectors.append(vectors)
-            all_chunk_ids.extend(chunk_ids)
-
-            for chunk_id, chunk in zip(chunk_ids, chunks):
-                all_bm25_docs.append({
-                    "chunk_id": chunk_id,
-                    "document_id": document_id,
-                    "title": chunk["title"],
-                    "file_name": chunk["file_name"],
-                    "section": chunk["section"],
-                    "parent_h1": chunk.get("parent_h1"),
-                    "parent_h2": chunk.get("parent_h2"),
-                    "content": chunk["content"],
-                })
 
         if not all_vectors:
             print("[INFO] 생성된 벡터가 없습니다.")
@@ -552,40 +645,50 @@ def index_markdown_files(data_dir: str):
         print(f"[DONE] 총 {len(all_chunk_ids)}개 chunk 인덱싱 완료")
         print(f"[DONE] FAISS 저장 위치: {INDEX_DIR}")
 
+    except Exception as e:
+        logging.exception(f"[ERROR] index_markdown_files 실패: {e}")
+        raise
+
     finally:
-        conn.close()
+        if conn:
+            conn.close()
 
 
 # =========================
 # BM25 검색
 # =========================
 def bm25_search(query: str, top_k: int = 10) -> list[dict]:
-    bm25, docs = load_bm25_index(INDEX_DIR)
+    try:
+        bm25, docs = load_bm25_index(INDEX_DIR)
 
-    query_tokens = bm25_tokenize(query)
-    scores = bm25.get_scores(query_tokens)
+        query_tokens = bm25_tokenize(query)
+        scores = bm25.get_scores(query_tokens)
 
-    ranked = sorted(
-        zip(docs, scores),
-        key=lambda x: x[1],
-        reverse=True
-    )[:top_k]
+        ranked = sorted(
+            zip(docs, scores),
+            key=lambda x: x[1],
+            reverse=True
+        )[:top_k]
 
-    results = []
-    for doc, score in ranked:
-        results.append({
-            "chunk_id": doc["chunk_id"],
-            "document_id": doc["document_id"],
-            "title": doc["title"],
-            "file_name": doc["file_name"],
-            "section": doc["section"],
-            "parent_h1": doc["parent_h1"],
-            "parent_h2": doc["parent_h2"],
-            "content": doc["content"],
-            "bm25_score": float(score),
-        })
+        results = []
+        for doc, score in ranked:
+            results.append({
+                "chunk_id": doc["chunk_id"],
+                "document_id": doc["document_id"],
+                "title": doc["title"],
+                "file_name": doc["file_name"],
+                "section": doc["section"],
+                "parent_h1": doc["parent_h1"],
+                "parent_h2": doc["parent_h2"],
+                "content": doc["content"],
+                "bm25_score": float(score),
+            })
 
-    return results
+        return results
+
+    except Exception as e:
+        logging.exception(f"[ERROR] bm25_search 실패: {e}")
+        return []
 
 
 # =========================
@@ -679,8 +782,9 @@ def fetch_chunks_by_ids(chunk_ids: List[int]) -> Dict[int, Dict]:
     if not chunk_ids:
         return {}
 
-    conn = get_connection()
+    conn = None
     try:
+        conn = get_connection()
         with conn.cursor() as cursor:
             placeholders = ", ".join(["%s"] * len(chunk_ids))
             sql = f"""
@@ -703,13 +807,20 @@ def fetch_chunks_by_ids(chunk_ids: List[int]) -> Dict[int, Dict]:
             cursor.execute(sql, chunk_ids)
             rows = cursor.fetchall()
             return {row["id"]: row for row in rows}
+
+    except Exception as e:
+        logging.exception(f"[ERROR] fetch_chunks_by_ids 실패: {e}")
+        return {}
+
     finally:
-        conn.close()
+        if conn:
+            conn.close()
 
 
 def fetch_chunks_by_parent_h1(document_id: int, parent_h1: str) -> List[Dict]:
-    conn = get_connection()
+    conn = None
     try:
+        conn = get_connection()
         with conn.cursor() as cursor:
             sql = """
                 SELECT
@@ -731,8 +842,14 @@ def fetch_chunks_by_parent_h1(document_id: int, parent_h1: str) -> List[Dict]:
             """
             cursor.execute(sql, (document_id, parent_h1))
             return cursor.fetchall()
+
+    except Exception as e:
+        logging.exception(f"[ERROR] fetch_chunks_by_parent_h1 실패: {e}")
+        return []
+
     finally:
-        conn.close()
+        if conn:
+            conn.close()
 
 
 def expand_result_to_parent_context(item: Dict) -> Dict:
@@ -769,83 +886,53 @@ def expand_result_to_parent_context(item: Dict) -> Dict:
     return expanded
 
 
-def min_max_normalize(scores: List[float]) -> List[float]:
-    if not scores:
-        return []
-    min_score = min(scores)
-    max_score = max(scores)
-
-    if max_score == min_score:
-        return [1.0 for _ in scores]
-
-    return [(s - min_score) / (max_score - min_score) for s in scores]
-
-
 # =========================
 # Hybrid Search
 # =========================
 def semantic_search(query: str, top_k: int = 10) -> List[Dict]:
-    embedder = Embedder(EMBED_MODEL)
-    index, id_map = load_faiss_index(INDEX_DIR)
-
-    qvec = embedder.embed_query(query)
-    qvec = normalize(qvec)
-
-    scores, indices = index.search(qvec, top_k)
-
-    candidate_ids = []
-    score_map = {}
-
-    for score, idx in zip(scores[0], indices[0]):
-        if idx == -1:
-            continue
-        chunk_id = id_map[idx]
-        candidate_ids.append(chunk_id)
-        score_map[chunk_id] = float(score)
-
-    chunk_map = fetch_chunks_by_ids(candidate_ids)
-
-    results = []
-    for chunk_id in candidate_ids:
-        chunk = chunk_map.get(chunk_id)
-        if not chunk:
-            continue
-        results.append({
-            "chunk_id": chunk_id,
-            "document_id": chunk["document_id"],
-            "title": chunk["title"],
-            "file_name": chunk["file_name"],
-            "section": chunk["section"],
-            "parent_h1": chunk["parent_h1"],
-            "parent_h2": chunk["parent_h2"],
-            "content": chunk["content"],
-            "semantic_score": score_map[chunk_id],
-        })
-
-    return results
-
-
-def keyword_search_mysql(query: str, limit: int = 10) -> List[Dict]:
-    conn = get_connection()
     try:
-        with conn.cursor() as cursor:
-            sql = """
-                SELECT
-                    c.CHUNKS_ID AS id,
-                    c.DOCUMENT_ID AS document_id,
-                    c.CHUNK_INDEX AS chunk_index,
-                    c.SECTION AS section,
-                    c.CONTENT AS content,
-                    MATCH(c.CONTENT) AGAINST(%s IN NATURAL LANGUAGE MODE) AS keyword_score
-                FROM CHATBOT_DATA_CHUNKS c
-                WHERE MATCH(c.CONTENT) AGAINST(%s IN NATURAL LANGUAGE MODE)
-                ORDER BY keyword_score DESC
-                LIMIT %s
-            """
-            cursor.execute(sql, (query, query, limit))
-            return cursor.fetchall()
-    finally:
-        conn.close()
+        embedder = Embedder(EMBED_MODEL)
+        index, id_map = load_faiss_index(INDEX_DIR)
+
+        qvec = embedder.embed_query(query)
+        qvec = normalize(qvec)
+
+        scores, indices = index.search(qvec, top_k)
+
+        candidate_ids = []
+        score_map = {}
+
+        for score, idx in zip(scores[0], indices[0]):
+            if idx == -1:
+                continue
+            chunk_id = id_map[idx]
+            candidate_ids.append(chunk_id)
+            score_map[chunk_id] = float(score)
+
+        chunk_map = fetch_chunks_by_ids(candidate_ids)
+
+        results = []
+        for chunk_id in candidate_ids:
+            chunk = chunk_map.get(chunk_id)
+            if not chunk:
+                continue
+            results.append({
+                "chunk_id": chunk_id,
+                "document_id": chunk["document_id"],
+                "title": chunk["title"],
+                "file_name": chunk["file_name"],
+                "section": chunk["section"],
+                "parent_h1": chunk["parent_h1"],
+                "parent_h2": chunk["parent_h2"],
+                "content": chunk["content"],
+                "semantic_score": score_map[chunk_id],
+            })
+
+        return results
+
+    except Exception as e:
+        logging.exception(f"[ERROR] semantic_search 실패: {e}")
+        return []
 
 
 def hybrid_search(query: str,
@@ -853,20 +940,25 @@ def hybrid_search(query: str,
                   bm25_top_k: int = 20,
                   fused_top_k: int = 20,
                   rerank_top_k: int = 3) -> list[dict]:
-    semantic_results = semantic_search(query, top_k=semantic_top_k)
-    bm25_results = bm25_search(query, top_k=bm25_top_k)
+    try:
+        semantic_results = semantic_search(query, top_k=semantic_top_k)
+        bm25_results = bm25_search(query, top_k=bm25_top_k)
 
-    fused = rrf_fusion(semantic_results, bm25_results)
-    fused = fused[:fused_top_k]
+        if not semantic_results and not bm25_results:
+            return []
 
-    reranker = Reranker(
-        os.getenv("RERANK_MODEL", "cross-encoder/ms-marco-MiniLM-L6-v2")
-    )
-    reranked = reranker.rerank(query, fused, top_k=rerank_top_k)
+        fused = rrf_fusion(semantic_results, bm25_results)
+        fused = fused[:fused_top_k]
 
-    expanded_results = [expand_result_to_parent_context(item) for item in reranked]
-    return expanded_results
+        reranker = get_reranker()
+        reranked = reranker.rerank(query, fused, top_k=rerank_top_k)
 
+        expanded_results = [expand_result_to_parent_context(item) for item in reranked]
+        return expanded_results
+
+    except Exception as e:
+        logging.exception(f"[ERROR] hybrid_search 실패: {e}")
+        return []
 
 # =========================
 # Answer Generation
@@ -879,7 +971,7 @@ def build_context_from_results(results: list[dict], max_items: int = 5) -> str:
     parts = []
 
     for i, item in enumerate(selected, start=1):
-        content_for_answer = item.get("expanded_content", item["content"])
+        content_for_answer = item.get("expanded_content") or item.get("content", "")
 
         part = (
             f"[문서 {i}]\n"
@@ -893,94 +985,6 @@ def build_context_from_results(results: list[dict], max_items: int = 5) -> str:
         parts.append(part)
 
     return "\n\n".join(parts)
-
-
-def build_single_result_prompt(user_query: str, item: dict) -> str:
-    content_for_answer = item.get("expanded_content", item["content"])
-
-    return f"""
-너는 소상공인을 위한 한국의 정부지원정책 및 대출 정보를 안내하는 친절한 한국어 챗봇이다.
-
-반드시 아래에 제공된 내용만 바탕으로 답변하라.
-없는 내용은 추측하지 말고, 확인이 어려운 부분은 자연스럽게 부족한 점을 설명하라.
-숫자, 금액, 날짜, 연령, 비율, 조건은 원래 의미를 바꾸지 말고 유지하라.
-
-답변 원칙:
-- 말투는 공고문 요약처럼 딱딱하지 않게, 실제 상담 챗봇처럼 부드럽고 친절하게 작성한다.
-- "문서 기준", "문서상", "공고상" 같은 표현은 쓰지 않는다.
-- 대신 "안내된 내용을 보면", "지금 보이는 내용으로는", "적혀 있는 내용을 바탕으로 보면" 같은 자연스러운 표현을 사용한다.
-- 없는 정보는 "지금 보이는 내용에는 따로 안내되지 않았어요"처럼 부드럽게 말한다.
-- 질문과 직접 관련 있는 내용부터 우선해서 설명한다.
-- 사용자가 이해하기 쉽게 풀어서 설명하되, 없는 내용을 지어내지는 않는다.
-- 답변은 "안내드릴게요", "보여요", "같아요", "확인돼요", "살펴보면" 같은 자연스러운 표현을 적절히 활용하라.
-
-먼저 해야 할 일:
-1. 아래 내용이 "지원정책"에 관한 문서인지, "대출상품/대출정보"에 관한 문서인지 먼저 파악하라.
-2. 그다음 사용자의 질문 의도가 무엇인지 파악하라.
-   - 받을 수 있는지 / 해당되는지
-   - 어떤 지원인지 / 어떤 대출인지
-   - 지원금액 / 대출한도
-   - 신청조건 / 가입대상 세부요건
-   - 신청방법 / 이용방법
-   - 신청기간
-   - 금리 / 상환방식 / 대출종류
-   - 유의사항 / 제외대상
-   - 전반적인 요약
-3. 질문과 직접 관련 있는 항목만 우선해서 설명하라.
-
-문서 유형별 답변 방법:
-
-[지원정책 문서라면]
-- 아래와 같은 항목이 보일 수 있다:
-  지원대상, 지원내용, 지원금액, 지원조건, 신청방법, 신청기간, 유의사항, 제외대상, 링크 URL
-- 하지만 항목명은 문서마다 조금씩 다를 수 있으니, 실제로 보이는 항목을 우선 활용하라.
-- 사용자가 받을 수 있는지 물으면, 확인되는 조건만 가지고 자연스럽게 설명하라.
-- 가능성 설명은 아래 셋 중 하나의 방향으로 하라.
-  - 해당될 가능성이 있어 보여요
-  - 어려워 보여요
-  - 판단하기는 어려워요
-
-[대출 문서라면]
-- 아래와 같은 항목이 보일 수 있다:
-  금융회사명, 가입대상 세부요건, 대출한도, 대출종류, 금리방식, 상환방식, 대출금리(평균), 기준금리(평균), 가산금리(평균)
-- 하지만 항목명은 문서마다 조금씩 다를 수 있으니, 실제로 보이는 항목을 우선 활용하라.
-- 사용자가 받을 수 있는지, 이용할 수 있는지 물으면 가입대상 세부요건, 업종, 신용등급, 지역, 사업자 상태 같은 조건을 중심으로 설명하라.
-- 금리를 물으면 대출금리(평균), 기준금리(평균), 가산금리(평균), 금리방식을 우선 설명하라.
-- 한도를 물으면 대출한도를 우선 설명하라.
-- 상환 관련 질문이면 상환방식과 만기/분할 여부를 우선 설명하라.
-- 조건이 일부만 보이면 단정하지 말고, 확인되는 범위까지만 설명하라.
-
-답변 작성 방법:
-- 첫 줄: 질문에 대한 짧고 자연스러운 한 줄 답변
-- 본문: 질문과 관련된 내용을 중심으로 자연스럽게 설명
-- 마지막:
-  - 확인해볼 포인트: 1~3개
-  - 출처: 문서명, 대표 섹션명
-
-답변에 포함할 내용은 문서 유형에 따라 유연하게 고르라.
-예를 들면:
-- 지원정책이면 대상, 내용, 금액, 신청조건, 신청방법, 신청기간, 유의사항 중심
-- 대출이면 금융회사, 가입대상, 한도, 금리, 상환방식, 대출종류 중심
-- 사용자가 묻지 않은 항목은 짧게만 언급하거나 생략할 수 있다.
-
-추가 규칙:
-- 링크 URL이 실제로 보이지 않으면 만들어내지 않는다.
-- 표처럼 보이는 데이터를 그대로 나열하기보다, 사용자가 이해하기 쉽게 설명형 문장으로 바꿔서 답하라.
-- 다만 숫자, 퍼센트, 한도, 기간, 신용등급, 지역 조건은 바꾸지 않는다.
-- 여러 항목이 반복되더라도 질문과 가장 관련 있는 정보부터 정리하라.
-
-[사용자 질문]
-{user_query}
-
-[문서 메타데이터]
-문서명: {item['title']}
-파일명: {item['file_name']}
-상위섹션: {item.get('parent_h1', '')}
-대표 섹션: {item['section']}
-
-[문서 전체 내용]
-{content_for_answer}
-""".strip()
 
 
 # 서비스 소개 전용 프롬프트
@@ -1012,21 +1016,77 @@ def build_service_intro_prompt(user_query: str, item: dict) -> str:
 {content_for_answer}
 """.strip()
 
+def build_multi_result_prompt(user_query: str, results: list[dict]) -> str:
+    context = build_context_from_results(results, max_items=min(5, len(results)))
 
-def generate_single_answer(query: str, item: dict, model: str) -> str:
-    client = OpenAI()
+    return f"""
+너는 소상공인을 위한 한국의 정부지원정책 및 대출 정보를 안내하는 친절한 한국어 챗봇이다.
 
-    if item.get("document_type") == "service_intro":
-        prompt = build_service_intro_prompt(query, item)
-    else:
-        prompt = build_single_result_prompt(query, item)
+반드시 아래에 제공된 검색 결과 문서들만 바탕으로 답변하라.
+문서에 없는 내용은 절대 추측하지 말고, 서로 다른 문서에 정보가 나뉘어 있으면 종합해서 설명하라.
+숫자, 금액, 날짜, 연령, 비율, 조건은 원래 의미를 바꾸지 말고 유지하라.
 
-    response = client.responses.create(
-        model=model,
-        input=prompt
-    )
+답변 원칙:
+- 공고문 말투가 아니라 실제 상담 챗봇처럼 자연스럽고 친절하게 작성한다.
+- 질문과 직접 관련 있는 정보부터 우선 설명한다.
+- 문서마다 표현이 조금 달라도, 의미가 같은 내용은 하나로 묶어 설명할 수 있다.
+- 문서마다 조건이 다르면 그 차이를 분명히 설명한다.
+- 문서에 없는 내용은 "지금 확인된 내용에는 따로 안내되지 않았어요"처럼 답하라.
+- 링크를 문서에 실제로 확인한 경우에만 언급하라.
 
-    return response.output_text.strip()
+답변 형식:
+1. 첫 줄: 질문에 대한 짧고 자연스러운 한 줄 답변
+2. 본문: 핵심 내용을 이해하기 쉽게 정리
+3. 마지막:
+   - 확인해볼 포인트: 1~3개
+   - 참고한 문서:
+     - 문서명 / 대표 섹션 형태로 1~5개
+
+[사용자 질문]
+{user_query}
+
+[검색 결과 문서들]
+{context}
+""".strip()
+
+
+def generate_combined_answer(query: str, results: list[dict], model: str) -> str:
+    if not results:
+        return "관련 문서를 찾지 못해서 답변을 드리기 어려워요. 문서 인덱스 상태나 질문 표현을 다시 확인해주세요."
+
+    try:
+        client = get_openai_client()
+        prompt = build_multi_result_prompt(query, results)
+
+        response = client.responses.create(
+            model=model,
+            input=prompt
+        )
+        return response.output_text.strip()
+
+    except Exception as e:
+        logging.exception(f"[ERROR] generate_combined_answer 실패: {e}")
+        return "답변 생성 중 오류가 발생했어요. 잠시 후 다시 시도해주세요."
+
+
+
+def generate_service_answer(query: str, item: dict, model: str) -> str:
+    try:
+        client = get_openai_client()
+
+        if item.get("document_type") == "service_intro":
+            prompt = build_service_intro_prompt(query, item)
+
+        response = client.responses.create(
+            model=model,
+            input=prompt
+        )
+
+        return response.output_text.strip()
+
+    except Exception as e:
+        logging.exception(f"[ERROR] generate_service_answer 실패: {e}")
+        return "답변 생성 중 오류가 발생했어요. 잠시 후 다시 시도해주세요."
 
 # 관련 없는 질문일 때 바로 거절 문구 반환
 def build_unsupported_response() -> str:
@@ -1035,78 +1095,66 @@ def build_unsupported_response() -> str:
         "그리고 서비스 소개 관련 내용만 지원하고 있습니다."
     )
 
-def generate_answers_per_result(query: str, search_results: list[dict], model: str) -> list[dict]:
-    answers = []
-
-    for item in search_results:
-        answer_text = generate_single_answer(query, item, model)
-
-        answers.append({
-            "title": item["title"],
-            "file_name": item["file_name"],
-            "section": item["section"],
-            "rerank_score": item.get("rerank_score", 0.0),
-            "content": item.get("expanded_content", item["content"]),
-            "answer": answer_text
-        })
-
-    return answers
-
-
-def print_generated_answers(answer_items: list[dict]):
-    for i, item in enumerate(answer_items, start=1):
-        print("=" * 80)
-        print(f"[답변 {i}]")
-        print(f"문서명       : {item['title']}")
-        print(f"파일명       : {item['file_name']}")
-        print(f"섹션         : {item['section']}")
-        print(f"rerank_score : {item['rerank_score']:.4f}")
-        print("-" * 80)
-        print(item["answer"])
-        print()
 
 
 def answer_user_query(query: str, model: str = CHAT_MODEL) -> dict:
-    query_type = classify_query(query)
+    try:
+        if not query or not query.strip():
+            return build_error_response("질문이 비어 있습니다. 내용을 입력해주세요.")
 
-    if query_type == "unsupported":
-        return {
-            "type": "unsupported",
-            "answer": build_unsupported_response()
-        }
+        query_type = classify_query(query, model=model)
 
-    if query_type == "service_intro":
-        intro_doc = load_service_intro_document(DATA_DIR)
-
-        if not intro_doc:
+        if query_type == "unsupported":
             return {
-                "type": "error",
-                "answer": "서비스 소개 문서를 찾을 수 없습니다. 입지너구리_서비스소개.md 파일을 확인해주세요."
+                "type": "unsupported",
+                "answer": build_unsupported_response(),
+                "results": []
             }
 
-        answer_text = generate_single_answer(query, intro_doc, model=model)
-        return {
-            "type": "service_intro",
-            "results": [intro_doc],
-            "answers": [{
-                "title": intro_doc["title"],
-                "file_name": intro_doc["file_name"],
-                "section": intro_doc["section"],
-                "rerank_score": 1.0,
-                "content": intro_doc.get("expanded_content", intro_doc["content"]),
+        if query_type == "service_intro":
+            intro_doc = load_service_intro_document(DATA_DIR)
+
+            if not intro_doc:
+                return build_error_response(
+                    "서비스 소개 문서를 찾을 수 없습니다. 입지너구리_서비스소개.md 파일을 확인해주세요."
+                )
+
+            answer_text = generate_service_answer(query, intro_doc, model=model)
+            return {
+                "type": "service_intro",
+                "results": [intro_doc],
                 "answer": answer_text
-            }]
+            }
+
+        # 정책/대출 질문
+        results = hybrid_search(query)
+
+        if not results:
+            return {
+                "type": "policy_or_loan",
+                "results": [],
+                "answer": "관련된 정책 또는 대출 문서를 찾지 못했어요. 질문을 조금 더 구체적으로 적어주시면 도움이 될 수 있어요."
+            }
+
+        final_answer = generate_combined_answer(query, results, model=model)
+
+        return {
+            "type": "policy_or_loan",
+            "results": results,
+            "answer": final_answer
         }
 
-    # 정책/대출 질문은 기존 검색 흐름 사용
-    results = hybrid_search(query)
-    answer_items = generate_answers_per_result(query, results, model=model)
+    except FileNotFoundError as e:
+        logging.exception(f"[ERROR] 파일 없음: {e}")
+        return build_error_response(f"검색에 필요한 인덱스 파일이 없습니다. 먼저 index 명령을 실행해주세요. ({e})")
 
-    return {
-        "type": "policy_or_loan",
-        "results": results,
-        "answers": answer_items
-    }
+    except pymysql.MySQLError as e:
+        logging.exception(f"[ERROR] DB 오류: {e}")
+        return build_error_response("데이터베이스 처리 중 오류가 발생했어요. DB 연결 설정을 확인해주세요.")
+
+    except Exception as e:
+        logging.exception(f"[ERROR] answer_user_query 실패: {e}")
+        return build_error_response("질문 처리 중 예상치 못한 오류가 발생했어요. 잠시 후 다시 시도해주세요.")
 
 
 
@@ -1146,29 +1194,24 @@ if __name__ == "__main__":
     parser.add_argument("--query", type=str, default=None)
     args = parser.parse_args()
 
-    if args.command == "index":
-        index_markdown_files(DATA_DIR)
+    try:
+        if args.command == "index":
+            index_markdown_files(DATA_DIR)
 
-    elif args.command == "search":
-        if not args.query:
-            raise ValueError("search 명령에는 --query가 필요합니다.")
+        elif args.command == "search":
+            if not args.query:
+                raise ValueError("search 명령에는 --query가 필요합니다.")
 
-        response = answer_user_query(args.query, model=CHAT_MODEL)
+            response = answer_user_query(args.query, model=CHAT_MODEL)
 
-        if response["type"] == "unsupported":
-            print("\n[최종 답변]")
-            print(response["answer"])
-
-        elif response["type"] == "error":
-            print("\n[오류]")
-            print(response["answer"])
-
-        else:
-            print("\n[검색 결과]")
             if response.get("results"):
+                print("\n[검색 결과]")
                 print_search_results(response["results"])
 
             print("\n[최종 답변]")
-            print_generated_answers(response["answers"])
-        
-        
+            print(response["answer"])
+
+    except Exception as e:
+        logging.exception(f"[FATAL] CLI 실행 실패: {e}")
+        print("\n[오류]")
+        print(f"실행 중 오류가 발생했습니다: {e}")
