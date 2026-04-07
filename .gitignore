@@ -13,3 +13,9 @@ __pycache__/
 # IDE
 .vscode/
 .idea/
+
+# Python build/test caches
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
