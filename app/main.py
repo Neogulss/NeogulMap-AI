@@ -8,6 +8,16 @@ from app.core.config import settings
 from app.core.logging_config import setup_logging
 from app.service.policy_chatbot.chat_app import initialize_policy_chatbot_resources
 
+import os
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
+import torch
+# PyTorch 스레드 제한
+torch.set_num_threads(1)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
