@@ -1,0 +1,14 @@
+[Unit]
+Description=NeogulMap AI Chatbot
+After=network.target
+
+[Service]
+WorkingDirectory=/home/ubuntu/NeogulMap-AI
+ExecStart=/home/ubuntu/NeogulMap-AI/venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 2
+EnvironmentFile=/home/ubuntu/NeogulMap-AI/.env
+Restart=always
+RestartSec=5
+User=ubuntu
+
+[Install]
+WantedBy=multi-user.target

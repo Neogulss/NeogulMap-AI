@@ -2,10 +2,23 @@ import pickle
 import numpy as np
 import pandas as pd
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional
 
 app = FastAPI()
+
+# ── CORS ──────────────────────────────────────────────────
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",       # Vite 개발 서버
+        "http://13.209.5.156",         # EC2 운영
+    ],
+    allow_credentials=True,
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type"],
+)
 
 # ── 모델 및 데이터 로드 ────────────────────────────────────
 with open('행정동_추천_모델.pkl', 'rb') as f:

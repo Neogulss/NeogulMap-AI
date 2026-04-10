@@ -1,0 +1,14 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY 권리금_API/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY 권리금_API/main.py .
+COPY 권리금_API/행정동_좌표.csv .
+COPY 권리금_API/행정동_추천_모델.pkl .
+
+EXPOSE 8001
+
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8001", "--workers", "2"]
