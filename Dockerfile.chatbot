@@ -6,6 +6,8 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
+COPY app/service/policy_chatbot/vector_data ./app/service/policy_chatbot/vector_data
+COPY app/service/policy_chatbot/original_data ./app/service/policy_chatbot/original_data
 
 EXPOSE 8000
 
