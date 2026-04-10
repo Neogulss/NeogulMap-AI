@@ -7,7 +7,7 @@ from typing import List, Optional
 
 app = FastAPI()
 
-# ── 모델 로드 ──────────────────────────────────────────────
+# ── 모델 및 데이터 로드 ────────────────────────────────────
 with open('행정동_추천_모델.pkl', 'rb') as f:
     payload = pickle.load(f)
 
@@ -27,6 +27,7 @@ stats_upjong     = payload['stats_upjong']
 upjong_code_dict = payload['upjong_code_dict']
 SEOUL_TO_JOMPO   = payload['SEOUL_TO_JOMPO']
 
+# 행정동 좌표 CSV
 coord_df   = pd.read_csv('행정동_좌표.csv', encoding='utf-8-sig')
 coord_dict = coord_df.set_index('hdong').to_dict('index')
 
@@ -51,7 +52,7 @@ class DongResult(BaseModel):
     latitude:                Optional[float]
     serviceIndustryCode:     Optional[str]
     serviceIndustryCodeName: Optional[str]
-    estimatedCost:           Optional[int]  # 권리금 + 보증금 합산 (만원)
+    estimatedCost:           Optional[int]
 
 
 class RecommendResponse(BaseModel):
@@ -59,19 +60,19 @@ class RecommendResponse(BaseModel):
 
 
 # ── 유틸 함수 ─────────────────────────────────────────────
-def get_area_bin(면적):
-    if 면적 <= 30:    return '~30㎡'
-    elif 면적 <= 50:  return '31~50㎡'
-    elif 면적 <= 80:  return '51~80㎡'
-    elif 면적 <= 120: return '81~120㎡'
-    elif 면적 <= 200: return '121~200㎡'
+def get_area_bin(area):
+    if area <= 30:    return '~30㎡'
+    elif area <= 50:  return '31~50㎡'
+    elif area <= 80:  return '51~80㎡'
+    elif area <= 120: return '81~120㎡'
+    elif area <= 200: return '121~200㎡'
     else:             return '200㎡~'
 
 
-def get_floor_bin(층수):
-    if 층수 < 0:    return '지하'
-    elif 층수 == 1: return '1층'
-    else:           return '2층이상'
+def get_floor_bin(floor):
+    if floor < 0:    return '지하'
+    elif floor == 1: return '1층'
+    else:            return '2층이상'
 
 
 def build_vec(hdong, feats, enc_val, enc_col, floor, area):
@@ -106,17 +107,18 @@ def health():
 @app.post("/recommend", response_model=RecommendResponse)
 def recommend(req: RecommendRequest):
 
+    # 업종 유효성 확인
     if req.service_type not in enc_boseo_100:
         return RecommendResponse(results=[])
 
     budget      = req.budget
     budget_low  = budget * 0.7
     budget_high = budget * 1.0
-    면적구간     = get_area_bin(req.area)
-    층수구간     = get_floor_bin(req.floor)
+    area_bin    = get_area_bin(req.area)
+    floor_bin   = get_floor_bin(req.floor)
     enc_b       = enc_boseo_100.get(req.service_type, mean_boseo)
     enc_k       = enc_kwon_100.get(req.service_type, mean_kwon)
-    업종코드     = upjong_code_dict.get(req.service_type)
+    industry_code = upjong_code_dict.get(req.service_type)
 
     candidates = []
 
@@ -124,6 +126,7 @@ def recommend(req: RecommendRequest):
         if hdong not in xd.index:
             continue
 
+        # 모델 예측
         vb = build_vec(hdong, feats_boseo, enc_b,
                        '업종_enc_보증금', req.floor, req.area)
         vk = build_vec(hdong, feats_kwon,  enc_k,
@@ -135,12 +138,12 @@ def recommend(req: RecommendRequest):
         pred_k     = max(500, round(model_kwon.predict(vk)[0]  / 100) * 100)
         pred_total = pred_b + pred_k
 
-        # 실거래 통계 보정
+        # 실거래 통계 보정 (상세 → 기본 fallback)
         실거래 = stats_detail[
             (stats_detail['hdong']     == hdong) &
             (stats_detail['서울시_업종'] == req.service_type) &
-            (stats_detail['층수_구간']  == 층수구간) &
-            (stats_detail['면적_구간']  == 면적구간)
+            (stats_detail['층수_구간']  == floor_bin) &
+            (stats_detail['면적_구간']  == area_bin)
         ]
         if 실거래.empty:
             실거래 = stats_upjong[
@@ -173,6 +176,8 @@ def recommend(req: RecommendRequest):
     if not candidates:
         return RecommendResponse(results=[])
 
+    # 예산 범위 안 → 상권점수 높은 순
+    # 예산 범위 밖 → 차이 작은 순
     candidates.sort(key=lambda x: (
         x['priority'],
         -x['score'] if x['priority'] == 0 else x['diff']
@@ -191,7 +196,7 @@ def recommend(req: RecommendRequest):
             districtName            = district_name,
             longitude               = info.get('longitude'),
             latitude                = info.get('latitude'),
-            serviceIndustryCode     = 업종코드,
+            serviceIndustryCode     = industry_code,
             serviceIndustryCodeName = req.service_type,
             estimatedCost           = c['display'],
         ))
