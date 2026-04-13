@@ -125,8 +125,8 @@ def recommend(req: RecommendRequest):
         return RecommendResponse(results=[])
 
     budget      = req.budget
-    budget_low  = budget * 0.7
-    budget_high = budget * 1.0
+    budget_low  = budget * 0.6
+    budget_high = budget * 1.4
     area_bin    = get_area_bin(req.area)
     floor_bin   = get_floor_bin(req.floor)
     enc_b       = enc_boseo_100.get(req.service_type, mean_boseo)
