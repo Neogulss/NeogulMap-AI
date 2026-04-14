@@ -19,3 +19,6 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+
+# 예측 모델 파일(saved_sales_models)
+report_pred_api/saved_sales_models/
