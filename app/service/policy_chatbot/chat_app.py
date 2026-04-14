@@ -1,29 +1,19 @@
-import json
 import logging
-import os
-import pickle
-import re
 import time
 from collections import OrderedDict
 from pathlib import Path
 from threading import Lock
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
-import faiss
-import numpy as np
 import pymysql
 from openai import OpenAI
-from rank_bm25 import BM25Okapi
 from sentence_transformers import CrossEncoder
 
 from app.core.config import settings
 from app.core.database import get_connection
+from app.service.policy_chatbot import data_indexing
 from app.schema.policy_chatbot_schema import PolicyChatbotAskRequest
-from app.utils.text_utils import (
-    approximate_token_count,
-    preprocess_markdown,
-    safe_json_loads,
-)
+from app.utils.text_utils import safe_json_loads
 
 _OPENAI_CLIENT = OpenAI(api_key=settings.OPENAI_API_KEY)
 _POLICY_CHATBOT_RERANKER = None
@@ -113,7 +103,7 @@ def load_service_intro_document(data_dir: str) -> Optional[dict]:
     if not file_path:
         return None
 
-    title, chunks = build_chunks_from_markdown(file_path)
+    title, chunks = data_indexing.build_chunks_from_markdown(file_path)
 
     if not chunks:
         return None
@@ -224,144 +214,6 @@ def build_retrieval_query(user_query: str, user_profile: Optional[dict]) -> str:
 
 
 # =========================
-# markdown chunking
-# =========================
-def extract_title_from_markdown(text: str, fallback: str) -> str:
-    for line in text.splitlines():
-        m = re.match(r"^#\s+(.*)$", line.strip())
-        if m:
-            return m.group(1).strip()
-    return fallback
-
-
-def split_by_markdown_headers(text: str) -> List[Dict[str, str]]:
-    lines = text.splitlines()
-
-    sections = []
-    current_h1 = None
-    current_h2 = None
-    current_header = "문서 시작"
-    current_content = []
-
-    for line in lines:
-        line = line.rstrip()
-
-        if re.match(r"^#\s+", line):
-            if current_content:
-                content = "\n".join(current_content).strip()
-                if content:
-                    sections.append({
-                        "h1": current_h1,
-                        "h2": current_h2,
-                        "header": current_header,
-                        "content": content,
-                    })
-            current_h1 = line.strip()
-            current_h2 = None
-            current_header = line.strip()
-            current_content = []
-
-        elif re.match(r"^##\s+", line):
-            if current_content:
-                content = "\n".join(current_content).strip()
-                if content:
-                    sections.append({
-                        "h1": current_h1,
-                        "h2": current_h2,
-                        "header": current_header,
-                        "content": content,
-                    })
-            current_h2 = line.strip()
-            current_header = line.strip()
-            current_content = []
-
-        else:
-            current_content.append(line)
-
-    if current_content:
-        content = "\n".join(current_content).strip()
-        if content:
-            sections.append({
-                "h1": current_h1,
-                "h2": current_h2,
-                "header": current_header,
-                "content": content,
-            })
-
-    return sections
-
-
-def split_long_text(text: str, max_chars: int = 1200, overlap: int = 150) -> List[str]:
-    text = text.strip()
-    if len(text) <= max_chars:
-        return [text]
-
-    chunks = []
-    start = 0
-
-    while start < len(text):
-        end = min(len(text), start + max_chars)
-        chunk = text[start:end].strip()
-        if chunk:
-            chunks.append(chunk)
-
-        if end == len(text):
-            break
-
-        start = max(0, end - overlap)
-
-    return chunks
-
-
-def build_chunks_from_markdown(
-    file_path: Path,
-    max_chars: int = 1200,
-    overlap: int = 150,
-) -> Tuple[str, List[Dict]]:
-    raw_text = file_path.read_text(encoding="utf-8")
-    raw_text = preprocess_markdown(raw_text)
-
-    file_name = file_path.name
-    title = extract_title_from_markdown(raw_text, fallback=file_name)
-    sections = split_by_markdown_headers(raw_text)
-
-    chunks = []
-    chunk_index = 0
-
-    for section in sections:
-        h1 = section["h1"] or f"# {title}"
-        h2 = section["h2"]
-        header = section["header"]
-        content = section["content"]
-
-        combined = (
-            f"문서명: {title}\n"
-            f"파일명: {file_name}\n"
-            f"상위섹션: {h1}\n"
-            f"하위섹션: {h2 or '없음'}\n"
-            f"현재섹션: {header}\n"
-            f"내용:\n{content}"
-        )
-
-        sub_chunks = split_long_text(combined, max_chars=max_chars, overlap=overlap)
-
-        for chunk_text in sub_chunks:
-            chunks.append({
-                "chunk_index": chunk_index,
-                "file_name": file_name,
-                "title": title,
-                "section": header,
-                "parent_h1": h1,
-                "parent_h2": h2,
-                "content": chunk_text,
-                "token_count": approximate_token_count(chunk_text),
-            })
-            chunk_index += 1
-
-    return title, chunks
-
-
-# =========================
 # 검색용 DB 조회
 # =========================
 def fetch_chunks_by_ids(chunk_ids: List[int]) -> Dict[int, Dict]:
@@ -469,21 +321,8 @@ def expand_result_to_parent_context(item: Dict) -> Dict:
 
 
 # =========================
-# 임베딩 / FAISS / BM25 / Reranker
+# Reranker
 # =========================
-class Embedder:
-    def __init__(self, model_name: str):
-        self.client = get_openai_client()
-        self.model_name = model_name
-
-    def embed_query(self, text: str):
-        response = self.client.embeddings.create(
-            model=self.model_name,
-            input=[text]
-        )
-        return np.array([response.data[0].embedding], dtype="float32")
-
-
 class PolicyChatbotReranker:
     def __init__(self, model_name: str):
         self.model = CrossEncoder(
@@ -517,56 +356,16 @@ class PolicyChatbotReranker:
         return reranked[:top_k]
 
 
-def bm25_tokenize(text: str) -> List[str]:
-    text = text.lower()
-    return re.findall(r"[가-힣a-zA-Z0-9]+", text)
-
-
-def normalize(vectors: np.ndarray) -> np.ndarray:
-    norms = np.linalg.norm(vectors, axis=1, keepdims=True)
-    norms = np.clip(norms, 1e-12, None)
-    return vectors / norms
-
-
-def load_faiss_index(index_dir: str) -> Tuple[faiss.Index, List[int]]:
-    faiss_path = os.path.join(index_dir, "faiss.index")
-    id_map_path = os.path.join(index_dir, "id_map.json")
-
-    if not os.path.exists(faiss_path):
-        raise FileNotFoundError(f"FAISS 인덱스 파일이 없습니다: {faiss_path}")
-
-    if not os.path.exists(id_map_path):
-        raise FileNotFoundError(f"id_map 파일이 없습니다: {id_map_path}")
-
-    index = faiss.read_index(faiss_path)
-    with open(id_map_path, "r", encoding="utf-8") as f:
-        id_map = json.load(f)
-
-    return index, id_map
-
-
-def load_bm25_index(index_dir: str):
-    bm25_path = os.path.join(index_dir, "bm25.pkl")
-
-    if not os.path.exists(bm25_path):
-        raise FileNotFoundError(f"BM25 인덱스 파일이 없습니다: {bm25_path}")
-
-    with open(bm25_path, "rb") as f:
-        data = pickle.load(f)
-
-    return data["bm25"], data["docs"]
-
-
 # =========================
 # Search
 # =========================
 def semantic_search(query: str, top_k: int = 10) -> List[Dict]:
     try:
-        embedder = Embedder(settings.EMBED_MODEL)
-        index, id_map = load_faiss_index(settings.INDEX_DIR)
+        embedder = data_indexing.Embedder(get_openai_client(), settings.EMBED_MODEL)
+        index, id_map = data_indexing.load_faiss_index(settings.INDEX_DIR)
 
         qvec = embedder.embed_query(query)
-        qvec = normalize(qvec)
+        qvec = data_indexing.normalize(qvec)
 
         scores, indices = index.search(qvec, top_k)
 
@@ -609,9 +408,9 @@ def semantic_search(query: str, top_k: int = 10) -> List[Dict]:
 
 def bm25_search(query: str, top_k: int = 10) -> List[Dict]:
     try:
-        bm25, docs = load_bm25_index(settings.INDEX_DIR)
+        bm25, docs = data_indexing.load_bm25_index(settings.INDEX_DIR)
 
-        query_tokens = bm25_tokenize(query)
+        query_tokens = data_indexing.bm25_tokenize(query)
         scores = bm25.get_scores(query_tokens)
 
         ranked = sorted(
