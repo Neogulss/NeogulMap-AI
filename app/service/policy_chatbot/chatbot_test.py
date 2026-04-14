@@ -1,5 +1,6 @@
 import sys
 import types
+import time
 from pathlib import Path
 
 import streamlit as st
@@ -78,10 +79,13 @@ if st.button("테스트 실행", type="primary"):
     )
 
     with st.spinner("답변 생성 중..."):
+        started_at = time.perf_counter()
         result = answer_policy_chatbot_query(request)
+        elapsed_ms = int((time.perf_counter() - started_at) * 1000)
 
     st.subheader("답변")
     st.write(result.get("answer", ""))
+    st.caption(f"응답 시간: {elapsed_ms} ms ({elapsed_ms / 1000:.2f}초)")
 
     st.subheader("메타")
     st.json(

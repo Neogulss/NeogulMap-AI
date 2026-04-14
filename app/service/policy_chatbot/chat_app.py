@@ -13,11 +13,18 @@ from app.core.config import settings
 from app.core.database import get_connection
 from app.service.policy_chatbot import data_indexing
 from app.schema.policy_chatbot_schema import PolicyChatbotAskRequest
-from app.utils.text_utils import safe_json_loads
 
 _OPENAI_CLIENT = OpenAI(api_key=settings.OPENAI_API_KEY)
 _POLICY_CHATBOT_RERANKER = None
 _POLICY_CHATBOT_RERANKER_LOCK = Lock()
+_POLICY_CHATBOT_EMBEDDER = None
+_POLICY_CHATBOT_EMBEDDER_LOCK = Lock()
+_POLICY_CHATBOT_FAISS = None
+_POLICY_CHATBOT_FAISS_ID_MAP = None
+_POLICY_CHATBOT_FAISS_LOCK = Lock()
+_POLICY_CHATBOT_BM25 = None
+_POLICY_CHATBOT_BM25_DOCS = None
+_POLICY_CHATBOT_BM25_LOCK = Lock()
 
 
 def now_ms() -> int:
@@ -34,6 +41,40 @@ def initialize_policy_chatbot_resources() -> None:
 
 def get_openai_client() -> OpenAI:
     return _OPENAI_CLIENT
+
+
+def get_policy_chatbot_embedder() -> "data_indexing.Embedder":
+    global _POLICY_CHATBOT_EMBEDDER
+    if _POLICY_CHATBOT_EMBEDDER is None:
+        with _POLICY_CHATBOT_EMBEDDER_LOCK:
+            if _POLICY_CHATBOT_EMBEDDER is None:
+                _POLICY_CHATBOT_EMBEDDER = data_indexing.Embedder(
+                    get_openai_client(),
+                    settings.EMBED_MODEL,
+                )
+    return _POLICY_CHATBOT_EMBEDDER
+
+
+def get_policy_chatbot_faiss():
+    global _POLICY_CHATBOT_FAISS, _POLICY_CHATBOT_FAISS_ID_MAP
+    if _POLICY_CHATBOT_FAISS is None or _POLICY_CHATBOT_FAISS_ID_MAP is None:
+        with _POLICY_CHATBOT_FAISS_LOCK:
+            if _POLICY_CHATBOT_FAISS is None or _POLICY_CHATBOT_FAISS_ID_MAP is None:
+                _POLICY_CHATBOT_FAISS, _POLICY_CHATBOT_FAISS_ID_MAP = data_indexing.load_faiss_index(
+                    settings.INDEX_DIR
+                )
+    return _POLICY_CHATBOT_FAISS, _POLICY_CHATBOT_FAISS_ID_MAP
+
+
+def get_policy_chatbot_bm25():
+    global _POLICY_CHATBOT_BM25, _POLICY_CHATBOT_BM25_DOCS
+    if _POLICY_CHATBOT_BM25 is None or _POLICY_CHATBOT_BM25_DOCS is None:
+        with _POLICY_CHATBOT_BM25_LOCK:
+            if _POLICY_CHATBOT_BM25 is None or _POLICY_CHATBOT_BM25_DOCS is None:
+                _POLICY_CHATBOT_BM25, _POLICY_CHATBOT_BM25_DOCS = data_indexing.load_bm25_index(
+                    settings.INDEX_DIR
+                )
+    return _POLICY_CHATBOT_BM25, _POLICY_CHATBOT_BM25_DOCS
 
 
 def get_policy_chatbot_reranker() -> "PolicyChatbotReranker":
@@ -130,62 +171,46 @@ def load_service_intro_document(data_dir: str) -> Optional[dict]:
 # 분류 / 타이틀 / 질의 확장
 # =========================
 def classify_query(query: str, model: str = settings.CHAT_MODEL) -> str:
-    prompt = f"""
-너는 사용자의 질문을 아래 3가지 중 하나로만 분류하는 라우터다.
-
-분류 가능한 라벨:
-1. service_intro
-   - 입지너구리 서비스 자체의 소개, 목적, 기능, 사용법, 대상 사용자, 플랫폼 설명
-2. policy_or_loan
-   - 정부지원정책, 보조금, 지원금, 창업지원, 소상공인 지원, 대출, 정책자금, 보증, 금리, 상환, 한도 등
-3. unsupported
-   - 위 두 범주와 무관한 질문
-
-반드시 아래 JSON 형식으로만 답하라.
-{{
-  "label": "service_intro | policy_or_loan | unsupported",
-  "reason": "짧은 판단 이유"
-}}
-
-[사용자 질문]
-{query}
-""".strip()
-
-    try:
-        client = get_openai_client()
-        response = client.responses.create(model=model, input=prompt)
-        parsed = safe_json_loads(response.output_text.strip())
-        label = parsed.get("label", "").strip()
-
-        if label not in {"service_intro", "policy_or_loan", "unsupported"}:
-            raise ValueError(f"허용되지 않은 label: {label}")
-
-        return label
-
-    except Exception as e:
-        logging.exception("[ERROR] classify_query 실패: %s", e)
+    q = (query or "").strip().lower()
+    if not q:
         return "unsupported"
+
+    service_keywords = [
+        "입지너구리",
+        "서비스",
+        "기능",
+        "사용법",
+        "어떻게 써",
+        "플랫폼",
+    ]
+    policy_keywords = [
+        "정책",
+        "지원",
+        "지원금",
+        "보조금",
+        "대출",
+        "정책자금",
+        "보증",
+        "금리",
+        "한도",
+        "상환",
+        "창업",
+        "소상공인",
+    ]
+
+    has_service = any(k in q for k in service_keywords)
+    has_policy = any(k in q for k in policy_keywords)
+
+    if has_policy:
+        return "policy_or_loan"
+    if has_service:
+        return "service_intro"
+    return "unsupported"
 
 
 def suggest_session_title(user_query: str, answer: str = "", model: str = settings.CHAT_MODEL) -> str:
-    prompt = f"""
-다음 채팅 세션의 제목을 15자 이내의 자연스러운 한국어 명사구 1개로 만들어라.
-따옴표 없이 제목만 출력하라.
-
-[사용자 질문]
-{user_query}
-
-[답변 요약]
-{answer[:200]}
-""".strip()
-
-    try:
-        client = get_openai_client()
-        response = client.responses.create(model=model, input=prompt)
-        title = response.output_text.strip().replace('"', "").replace("\n", " ")
-        return title[:15] if title else user_query[:15]
-    except Exception:
-        return user_query[:15]
+    query = (user_query or "").strip().replace("\n", " ")
+    return query[:15] if query else "새 채팅"
 
 
 def build_retrieval_query(user_query: str, user_profile: Optional[dict]) -> str:
@@ -364,8 +389,8 @@ class PolicyChatbotReranker:
 # =========================
 def semantic_search(query: str, top_k: int = 10) -> List[Dict]:
     try:
-        embedder = data_indexing.Embedder(get_openai_client(), settings.EMBED_MODEL)
-        index, id_map = data_indexing.load_faiss_index(settings.INDEX_DIR)
+        embedder = get_policy_chatbot_embedder()
+        index, id_map = get_policy_chatbot_faiss()
 
         qvec = embedder.embed_query(query)
         qvec = data_indexing.normalize(qvec)
@@ -411,7 +436,7 @@ def semantic_search(query: str, top_k: int = 10) -> List[Dict]:
 
 def bm25_search(query: str, top_k: int = 10) -> List[Dict]:
     try:
-        bm25, docs = data_indexing.load_bm25_index(settings.INDEX_DIR)
+        bm25, docs = get_policy_chatbot_bm25()
 
         query_tokens = data_indexing.bm25_tokenize(query)
         scores = bm25.get_scores(query_tokens)
@@ -560,33 +585,26 @@ def build_service_intro_prompt(user_query: str, item: dict) -> str:
     content_for_answer = item.get("expanded_content", item["content"])
 
     return f"""
-너는 ‘입지너구리’ 서비스 안내를 담당하는 챗봇이다.
-반드시 제공된 서비스 소개 문서의 내용만을 근거로 답변해야 한다.
+    역할: 너는 ‘입지너구리’ 서비스 소개 챗봇이다.
 
-[답변 원칙]
-- 답변은 항상 상냥하고 친근한 말투(~이에요, ~가 있어요, ~할 수 있어요)를 사용한다.
-- 중요한 내용은 이모티콘을 적절히 활용하여 가독성을 높인다.
-- 큰 카테고리는 **굵게** 표시하고, 항목 구분이 필요한 경우 "---" 구분선을 사용한다.
+    규칙:
+    - 반드시 [문서 내용]에 있는 정보만 사용해 답변한다.
+    - 문서에 없는 내용은 추측하거나 생성하지 않는다.
+    - 문서에 해당 정보가 없으면 "문서상 확인되지 않음"이라고 답한다.
+    - 사용자 질문과 관련된 내용만 간결하게 설명한다.
+    - 말투는 항상 친절한 한국어로 작성한다. ("~이에요", "~가 있어요", "~할 수 있어요")
+    - 큰 항목은 **굵게** 표시한다.
+    - 필요할 때만 "---"로 구분한다.
+    - 중요한 내용에는 이모티콘을 적절히 사용할 수 있다.
+    - 답변 마지막에 추가 제안, 선택지, 다음 단계 안내는 쓰지 않는다.
+    - "원하시면 ~", "추가로 ~ 도와드릴 수 있어요" 같은 문장은 금지한다.
 
-[내용 제한]
-- 반드시 서비스 소개 문서에 있는 내용만 사용한다.
-- 문서에 없는 내용은 절대 추측하거나 생성하지 않는다.
-- 문서에 해당 정보가 없는 경우 반드시 "문서상 확인되지 않음"이라고 명확하게 답한다.
+    [사용자 질문]
+    {user_query}
 
-[설명 범위]
-- 서비스 소개 문서의 내용은 모두 설명해야 한다.
-
-[출력 제한 - 매우 중요]
-- 답변 마지막에 추가적인 제안, 선택지, 다음 단계 안내를 포함하지 않는다.
-- “원하시면 ~해드릴게요”, “추가로 ~도 도와드릴 수 있어요” 등의 문장을 절대 사용하지 않는다.
-- 답변은 서비스 설명으로 자연스럽게 마무리한다.
-
-[사용자 질문]
-{user_query}
-
-[문서 내용]
-{content_for_answer}
-""".strip()
+    [문서 내용]
+    {content_for_answer}
+    """.strip()
 
 
 def build_multi_result_prompt(user_query: str, user_profile: Optional[dict], results: List[Dict]) -> str:
@@ -597,33 +615,33 @@ def build_multi_result_prompt(user_query: str, user_profile: Optional[dict], res
     profile_text = build_user_context_text(user_profile)
 
     return f"""
-당신은 한국의 정부지원정책, 창업지원, 정책자금, 대출 정보를 안내하는 친절한 한국어 챗봇이에요.
-사용자의 조건과 상황에 맞는 정책을 찾아서, 왜 이 정책이 사용자에게 적합한지 따뜻하게 설명해 주세요.
+    역할: 너는 한국의 정부지원정책, 창업지원, 정책자금, 대출 정보를 안내하는 한국어 챗봇이다.
 
-아래 규칙을 꼭 지켜주세요.
-- 반드시 아래 검색 결과 문서에 있는 내용만 바탕으로 답변해 주세요.
-- 문서에 없는 내용은 절대 추측하거나 지어내지 말아 주세요.
-- [사용자 추가 정보]가 있다면, 각 정책의 지원 대상/조건과 사용자 조건을 비교해서 적합 여부를 판단해 주세요.
-  예) "사용자님은 업력 3년 미만이시니 이 정책의 신청 대상에 해당돼요!" 처럼 구체적으로 연결해 주세요.
-- 사용자 조건과 잘 맞는 정책을 우선적으로 추천하고, 그 이유도 함께 설명해 주세요.
-- 문서에 명시되지 않은 조건은 단정 짓지 말고, 불확실한 경우 "추가 확인이 필요해요" 라고 안내해 주세요.
-- 답변은 ~이에요, ~가 있어요, ~할 수 있어요 처럼 상냥하고 친근한 말투로 작성해 주세요.
-- 중요한 내용이나 강조할 부분에는 이모티콘을 적절히 사용해서 읽기 편하고 친근하게 전달해 주세요.
-- 정책/상품 이름은 **굵게** 표시하고, 항목 구분이 필요한 경우 "---" 구분선을 활용해 주세요.
-- 각 정책/상품 소개 마지막에 문서에 URL이 있다면 반드시 포함해 주세요. 예) 🔗 자세히 보기: [URL]
-- 답변 마지막에 다음 단계 제안, 추가 질문 유도 문장은 포함하지 마세요.
-- “원하시면 ~해드릴게요”, “추가로 ~도 도와드릴 수 있어요”와 같은 안내 문구는 작성하지 마세요.
-- 답변은 정책 안내 내용으로 자연스럽게 마무리하세요.
+    규칙:
+    - 반드시 [검색 결과 문서]에 있는 내용만 사용해 답변한다.
+    - 문서에 없는 내용은 추측하거나 생성하지 않는다.
+    - [사용자 추가 정보]가 있으면 문서의 지원대상, 신청조건, 자격요건과 비교해 적합 여부를 설명한다.
+    - 사용자와 더 잘 맞는 정책/상품을 우선 소개한다.
+    - 적합한 이유는 문서 근거에 따라 짧고 분명하게 설명한다.
+    - 문서에 없는 조건은 판단하지 말고 "추가 확인이 필요해요"라고 답한다.
+    - 말투는 친절한 한국어로 작성한다. ("~이에요", "~가 있어요", "~할 수 있어요")
+    - 정책명/상품명은 **굵게** 표시한다.
+    - 필요할 때만 "---"로 구분한다.
+    - 중요한 내용에는 이모티콘을 적절히 사용할 수 있다.
+    - URL은 실제로 유효한 주소가 문서에 있는 경우에만 마지막에 "🔗 자세히 보기: URL" 형식으로 포함한다.
+    - URL 값이 "없음", "데이터 없음", "null", "None", 공백, 빈 문자열처럼 실질적으로 주소가 없는 경우에는 URL 문구 자체를 출력하지 않는다.
+    - 답변 마지막에 추가 질문 유도, 다음 단계 제안은 쓰지 않는다.
+    - "원하시면 ~", "추가로 ~ 도와드릴 수 있어요" 같은 문장은 금지한다.
 
-[사용자 질문]
-{user_query}
+    [사용자 질문]
+    {user_query}
 
-[사용자 추가 정보]
-{profile_text}
+    [사용자 추가 정보]
+    {profile_text}
 
-[검색 결과 문서]
-{context}
-""".strip()
+    [검색 결과 문서]
+    {context}
+    """.strip()
 
 
 def generate_service_answer(query: str, item: dict, model: str) -> str:
