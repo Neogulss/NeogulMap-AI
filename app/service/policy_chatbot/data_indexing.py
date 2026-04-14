@@ -68,6 +68,12 @@ def extract_title_from_markdown(text: str, fallback: str) -> str:
     return fallback
 
 
+def header_to_title(header: str, fallback: str) -> str:
+    if not header:
+        return fallback
+    return re.sub(r"^#+\s*", "", header).strip() or fallback
+
+
 def split_by_markdown_headers(text: str) -> List[Dict[str, str]]:
     lines = text.splitlines()
     sections = []
@@ -124,11 +130,12 @@ def build_chunks_from_markdown(file_path: Path, max_chars: int = 1200, overlap: 
     chunks, chunk_index = [], 0
     for section in sections:
         h1 = section["h1"] or f"# {title}"
+        section_title = header_to_title(h1, fallback=title)
         h2 = section["h2"]
         header = section["header"]
         content = section["content"]
         combined = (
-            f"문서명: {title}\n파일명: {file_name}\n상위섹션: {h1}\n"
+            f"문서명: {section_title}\n파일명: {file_name}\n상위섹션: {h1}\n"
             f"하위섹션: {h2 or '없음'}\n현재섹션: {header}\n내용:\n{content}"
         )
         for chunk_text in split_long_text(combined, max_chars=max_chars, overlap=overlap):
@@ -136,7 +143,7 @@ def build_chunks_from_markdown(file_path: Path, max_chars: int = 1200, overlap: 
                 {
                     "chunk_index": chunk_index,
                     "file_name": file_name,
-                    "title": title,
+                    "title": section_title,
                     "section": header,
                     "parent_h1": h1,
                     "parent_h2": h2,
@@ -242,7 +249,9 @@ def build_docs_from_markdown_dir(data_dir: str, max_chars: int = 1200, overlap: 
                     "chunk_index": chunk["chunk_index"],
                     "title": chunk["title"],
                     "file_name": chunk["file_name"],
-                    "source_path": str(file_path),
+                    # One markdown file can contain multiple top-level policies (# ...).
+                    # Split DB documents by parent_h1 so each policy name is preserved.
+                    "source_path": f"{file_path}::{chunk.get('parent_h1') or chunk['title']}",
                     "section": chunk["section"],
                     "parent_h1": chunk["parent_h1"],
                     "parent_h2": chunk["parent_h2"],
@@ -356,9 +365,9 @@ def build_and_save_indexes(data_dir: str, index_dir: str, embed_model: str, save
 
 if __name__ == "__main__":
     base_dir = Path(__file__).resolve().parent
-    data_dir = os.getenv("DATA_DIR", str(base_dir / "original_data"))
-    index_dir = os.getenv("INDEX_DIR", str(base_dir / "vector_data"))
-    embed_model = os.getenv("EMBED_MODEL", "text-embedding-3-small")
+    data_dir = os.getenv("DATA_DIR")
+    index_dir = os.getenv("INDEX_DIR")
+    embed_model = os.getenv("EMBED_MODEL")
     save_to_db = os.getenv("SAVE_TO_DB", "true").lower() in {"1", "true", "y", "yes"}
 
     stats = build_and_save_indexes(
