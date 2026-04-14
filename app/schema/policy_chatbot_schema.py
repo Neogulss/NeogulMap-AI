@@ -9,6 +9,7 @@ class UserProfileInput(BaseModel):
         default=None,
         description="사업자등록 여부"
     )
+    region: Optional[str] = Field(default=None, description="지역")
     
     
 class PolicyChatbotAskRequest(BaseModel):
