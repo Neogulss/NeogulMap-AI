@@ -37,15 +37,16 @@ class RiskInput(BaseModel):
     유동인구_변화_량: Optional[float] = None
     개업_율_lag1: Optional[float] = None
     avg_sales_per_transaction_lag1: Optional[float] = None
-    above_survival_avg: Optional[int] = None
-    above_closure_avg: Optional[int] = None
+    # above_survival_avg: Optional[int] = None
+    # above_closure_avg: Optional[int] = None
     
 
 # 폐업 예측 출력
 class RiskOutput(BaseModel):
     risk_prob: float                  # 폐업 위험 확률 (0~1)
-    risk_closure_rate: float          # 최종 예측 폐업률
+    risk_closure_rate: float                 # 회귀 기반 위험 점수
     risk_level: str                   # EX) LOW / MEDIUM / HIGH
+    # confidence: str                   # 예측 신뢰도 : HIGH / LOW
     top_risk_factors: Optional[list[dict]] = None
     message: Optional[str] = None     # 예외/주의 안내 문구
     
