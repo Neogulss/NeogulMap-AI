@@ -1,0 +1,13 @@
+[Unit]
+Description=NeogulMap report_pred API
+After=network.target
+
+[Service]
+WorkingDirectory=/home/ubuntu/NeogulMap-AI/report_pred_api
+ExecStart=/home/ubuntu/NeogulMap-AI/venv/bin/uvicorn report_pred_api.main:app --host 0.0.0.0 --port 8002 --workers 2
+Restart=always
+RestartSec=5
+User=ubuntu
+
+[Install]
+WantedBy=multi-user.target
