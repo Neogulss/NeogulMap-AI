@@ -8,6 +8,7 @@ from typing import Dict, List, Tuple
 
 import faiss
 import numpy as np
+import pymysql
 from rank_bm25 import BM25Okapi
 from openai import OpenAI
 from dotenv import load_dotenv
@@ -44,6 +45,19 @@ def _require_env(name: str) -> str:
     if not value:
         raise ValueError(f"{name} 환경변수가 필요합니다.")
     return value
+
+
+def _get_mysql_connection():
+    return pymysql.connect(
+        host=_require_env("MYSQL_HOST"),
+        port=int(os.getenv("MYSQL_PORT", "3306")),
+        user=_require_env("MYSQL_USER"),
+        password=_require_env("MYSQL_PASSWORD"),
+        database=_require_env("MYSQL_DB"),
+        charset="utf8mb4",
+        cursorclass=pymysql.cursors.DictCursor,
+        autocommit=False,
+    )
 
 
 def extract_title_from_markdown(text: str, fallback: str) -> str:
@@ -144,19 +158,27 @@ def normalize(vectors: np.ndarray) -> np.ndarray:
     return vectors / norms
 
 
+def sanitize_text_for_embedding(text: str) -> str:
+    # Remove problematic control/surrogate characters that can break JSON serialization.
+    text = (text or "").replace("\x00", " ")
+    text = text.encode("utf-8", "ignore").decode("utf-8", "ignore")
+    return text
+
+
 class Embedder:
     def __init__(self, openai_client, model_name: str):
         self.client = openai_client
         self.model_name = model_name
 
     def embed_query(self, text: str):
-        response = self.client.embeddings.create(model=self.model_name, input=[text])
+        clean_text = sanitize_text_for_embedding(text)
+        response = self.client.embeddings.create(model=self.model_name, input=[clean_text])
         return np.array([response.data[0].embedding], dtype="float32")
 
     def embed_texts(self, texts: List[str], batch_size: int = 100) -> np.ndarray:
         all_embeddings = []
         for i in range(0, len(texts), batch_size):
-            batch = texts[i : i + batch_size]
+            batch = [sanitize_text_for_embedding(t) for t in texts[i : i + batch_size]]
             response = self.client.embeddings.create(model=self.model_name, input=batch)
             for item in response.data:
                 all_embeddings.append(item.embedding)
@@ -209,18 +231,18 @@ def save_bm25_index(index_dir: str, docs: List[Dict]) -> None:
 def build_docs_from_markdown_dir(data_dir: str, max_chars: int = 1200, overlap: int = 150) -> List[Dict]:
     md_files = sorted(Path(data_dir).rglob("*.md"))
     docs: List[Dict] = []
-    chunk_id = 0
 
     for file_path in md_files:
         _, chunks = build_chunks_from_markdown(file_path, max_chars=max_chars, overlap=overlap)
         for chunk in chunks:
             docs.append(
                 {
-                    "chunk_id": chunk_id,
-                    "document_id": chunk_id,
+                    "chunk_id": None,
+                    "document_id": None,
                     "chunk_index": chunk["chunk_index"],
                     "title": chunk["title"],
                     "file_name": chunk["file_name"],
+                    "source_path": str(file_path),
                     "section": chunk["section"],
                     "parent_h1": chunk["parent_h1"],
                     "parent_h2": chunk["parent_h2"],
@@ -228,15 +250,99 @@ def build_docs_from_markdown_dir(data_dir: str, max_chars: int = 1200, overlap: 
                     "source": chunk["file_name"],
                 }
             )
-            chunk_id += 1
 
     return docs
 
 
-def build_and_save_indexes(data_dir: str, index_dir: str, embed_model: str) -> Dict[str, int]:
+def save_docs_to_db(docs: List[Dict]) -> Dict[str, int]:
+    """
+    Save chunks into CHATBOT_DOCUMENTS / CHATBOT_DATA_CHUNKS.
+    Existing rows with same (FILE_NAME, SOURCE_PATH) are replaced.
+    """
+    conn = _get_mysql_connection()
+    inserted_documents = 0
+    inserted_chunks = 0
+
+    try:
+        with conn.cursor() as cursor:
+            # Process grouped by source file to keep document/chunk relation clear.
+            grouped: Dict[Tuple[str, str], List[Dict]] = {}
+            for doc in docs:
+                key = (doc["file_name"], doc["source_path"])
+                grouped.setdefault(key, []).append(doc)
+
+            for (file_name, source_path), group_docs in grouped.items():
+                title = group_docs[0]["title"]
+
+                # Replace old document+chunks for same source file.
+                cursor.execute(
+                    """
+                    DELETE FROM CHATBOT_DOCUMENTS
+                    WHERE FILE_NAME = %s AND SOURCE_PATH = %s
+                    """,
+                    (file_name, source_path),
+                )
+
+                cursor.execute(
+                    """
+                    INSERT INTO CHATBOT_DOCUMENTS (FILE_NAME, TITLE, SOURCE_PATH)
+                    VALUES (%s, %s, %s)
+                    """,
+                    (file_name, title, source_path),
+                )
+                document_id = cursor.lastrowid
+                inserted_documents += 1
+
+                # Keep stable order for reproducible IDs/index alignment.
+                group_docs.sort(key=lambda x: x["chunk_index"])
+
+                for doc in group_docs:
+                    cursor.execute(
+                        """
+                        INSERT INTO CHATBOT_DATA_CHUNKS
+                        (DOCUMENT_ID, CHUNK_INDEX, SECTION, PARENT_H1, PARENT_H2, CONTENT, TOKEN_COUNT)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        """,
+                        (
+                            document_id,
+                            doc["chunk_index"],
+                            doc["section"],
+                            doc["parent_h1"],
+                            doc["parent_h2"],
+                            doc["content"],
+                            approximate_token_count(doc["content"]),
+                        ),
+                    )
+                    doc["document_id"] = document_id
+                    doc["chunk_id"] = cursor.lastrowid
+                    inserted_chunks += 1
+
+        conn.commit()
+        return {"documents": inserted_documents, "chunks": inserted_chunks}
+
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def assign_local_ids_for_non_db_mode(docs: List[Dict]) -> None:
+    for idx, doc in enumerate(docs):
+        doc["chunk_id"] = idx
+        doc["document_id"] = idx
+
+
+def build_and_save_indexes(data_dir: str, index_dir: str, embed_model: str, save_to_db: bool = True) -> Dict[str, int]:
     docs = build_docs_from_markdown_dir(data_dir)
     if not docs:
         raise FileNotFoundError(f"Markdown 파일이 없습니다: {data_dir}")
+
+    if save_to_db:
+        db_stats = save_docs_to_db(docs)
+    else:
+        assign_local_ids_for_non_db_mode(docs)
+        db_stats = {"documents": len({(d["file_name"], d["source_path"]) for d in docs}), "chunks": len(docs)}
 
     client = OpenAI(api_key=_require_env("OPENAI_API_KEY"))
     embedder = Embedder(client, embed_model)
@@ -245,7 +351,7 @@ def build_and_save_indexes(data_dir: str, index_dir: str, embed_model: str) -> D
     save_faiss_index(index_dir=index_dir, vectors=vectors, id_map=[doc["chunk_id"] for doc in docs])
     save_bm25_index(index_dir=index_dir, docs=docs)
 
-    return {"documents": len({doc["file_name"] for doc in docs}), "chunks": len(docs)}
+    return db_stats
 
 
 if __name__ == "__main__":
@@ -253,10 +359,12 @@ if __name__ == "__main__":
     data_dir = os.getenv("DATA_DIR", str(base_dir / "original_data"))
     index_dir = os.getenv("INDEX_DIR", str(base_dir / "vector_data"))
     embed_model = os.getenv("EMBED_MODEL", "text-embedding-3-small")
+    save_to_db = os.getenv("SAVE_TO_DB", "true").lower() in {"1", "true", "y", "yes"}
 
     stats = build_and_save_indexes(
         data_dir=data_dir,
         index_dir=index_dir,
         embed_model=embed_model,
+        save_to_db=save_to_db,
     )
-    print(f"[DONE] documents={stats['documents']}, chunks={stats['chunks']}")
+    print(f"[DONE] documents={stats['documents']}, chunks={stats['chunks']}, save_to_db={save_to_db}")
