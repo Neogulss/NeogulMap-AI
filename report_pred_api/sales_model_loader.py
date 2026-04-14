@@ -63,7 +63,7 @@ def load_sales_models():
             booster.load_model(os.path.join(MODEL_DIR, f"xgb_reg_{seg}.json"))
             models["xgb_reg"][seg] = booster
 
-        print("매출 예측 모델 로드 완료")
+        logger.info("매출 예측 모델 로드 완료")
         return models
     except Exception:
         logger.exception("매출 예측 모델 로드 실패")
