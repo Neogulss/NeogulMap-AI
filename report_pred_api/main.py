@@ -1,10 +1,10 @@
 import logging
 
 from fastapi import FastAPI, HTTPException
-from .schemas import SalesInput, SalesOutput, RiskInput, RiskOutput
-from .sales_predictor import predict_sales
-from .risk_predictor import predict_risk
-from .exceptions import PredictionError
+from schemas import SalesInput, SalesOutput, RiskInput, RiskOutput
+from sales_predictor import predict_sales
+from risk_predictor import predict_risk
+from exceptions import PredictionError
 from fastapi.middleware.cors import CORSMiddleware
 
 logging.basicConfig(
