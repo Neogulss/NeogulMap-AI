@@ -97,4 +97,5 @@ class SalesOutput(BaseModel):
     pred_sales: float               # 예측 월 매출 (원)
     segment: int                    # K-means 구간 4개
     confidence: str                 # 예측 신뢰도 : HIGH / LOW(구간 미만, 구간 초과)
+    top_sales_factors: Optional[list[dict]] = None  # feature importance TOP N 출력
     message: Optional[str] = None   # 소규모/대규모 예외 시 안내 메시지
