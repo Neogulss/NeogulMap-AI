@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 import xgboost as xgb
 import logging
+import shap
 
 from sales_model_loader import sales_models
 from schemas import SalesInput, SalesOutput
@@ -16,6 +17,12 @@ kmeans = sales_models["kmeans"]
 lgb_clf = sales_models["lgb_clf"]
 lgb_reg = sales_models["lgb_reg"]
 xgb_reg = sales_models["xgb_reg"]
+
+# SHAP 설정 추가 - SEGMENT 별 XGBoost explainer
+sales_explainers = {
+    seg: shap.TreeExplainer(model)
+    for seg, model in xgb_reg.items()
+}
 
 # 소규모 점포 기준: 유사_업종_점포_수 < 4이면 모델 예측 신뢰도 낮음
 # → 학습 시 소규모 점포는 폐업률 노이즈가 심해 제외했던 기준과 동일
@@ -56,6 +63,89 @@ def _encode_input(data: SalesInput) -> pd.DataFrame:
     
     return df
 
+# SHAP 계산용 입력
+def _prepare_shap_input(X: pd.DataFrame) -> pd.DataFrame:
+    """
+    SHAP 계산용 입력 생성
+
+    - XGBoost 추론은 category dtype을 사용하지만,
+      SHAP 계산 시에는 정수형 입력이 더 안전할 수 있어 별도 복사본 사용
+    """
+    X_shap = X.copy()
+
+    for col in config["cat_cols"]:
+        X_shap[col] = X_shap[col].astype(int)
+
+    return X_shap
+
+def _normalize_shap_values(shap_values) -> np.ndarray:
+    """
+    shap 버전/반환 타입 차이를 단일 행 1차원 배열로 정규화
+    """
+    if hasattr(shap_values, "values"):
+        values = np.asarray(shap_values.values)
+    else:
+        values = np.asarray(shap_values)
+
+    if values.ndim == 3:
+        return values[0, :, -1]
+    if values.ndim == 2:
+        return values[0]
+    return np.ravel(values)
+
+def _format_feature_value(value):
+    if pd.isna(value):
+        return None
+    if isinstance(value, (np.integer, int)):
+        return int(value)
+    if isinstance(value, (np.floating, float)):
+        return float(value)
+    return value
+
+def _get_top_sales_factors(
+    X: pd.DataFrame,
+    segment: int,
+    top_n: int = 5,
+) -> list[dict] | None:
+    """
+    segment별 XGBoost 회귀모델 기준 SHAP 상위 기여 피처 반환
+
+    반환 예시:
+    [
+        {
+            "feature": "sales_lag1_log",
+            "feature_value": 12.3,
+            "impact": 0.41,
+            "direction": "up",
+        }
+    ]
+    """
+    try:
+        X_shap = _prepare_shap_input(X)
+        shap_values = sales_explainers[segment].shap_values(X_shap)
+        values = _normalize_shap_values(shap_values)
+
+        factors = []
+        for feature, impact in zip(config["features"], values):
+            feature_value = X_shap.iloc[0][feature]
+            factors.append(
+                {
+                    "feature": feature,
+                    "feature_value": _format_feature_value(feature_value),
+                    "impact": float(impact),
+                    "direction": "up" if impact > 0 else "down",
+                }
+            )
+
+        factors.sort(key=lambda item: abs(item["impact"]), reverse=True)
+        return factors[:top_n]
+    except Exception:
+        logger.warning(
+            "Failed to calculate sales SHAP. segment=%s",
+            segment,
+            exc_info=True,
+        )
+        return None
 
 # 예측 메인 함수
 def predict_sales(data: SalesInput) -> SalesOutput:
@@ -73,7 +163,7 @@ def predict_sales(data: SalesInput) -> SalesOutput:
     8. 정상이면 HIGH 반환
     """
     try:
-        # STEP 1. 소규모 점포 예외처리
+        # 소규모 점포 예외처리
         
         # 유사_업종_점포_수 < 4이면 통계적으로 불안정
         # → 모델 예측 없이 바로 LOW 반환
@@ -82,13 +172,14 @@ def predict_sales(data: SalesInput) -> SalesOutput:
                 pred_sales=0.0,
                 segment=-1,
                 confidence="LOW",
+                top_sales_factors=None,
                 message="점포 수가 적어 예측 신뢰도가 낮습니다."
             )
 
-        # STEP 2. 입력 전처리
+        # 입력 전처리
         X = _encode_input(data)
 
-        # STEP 3. K-means 구간 결정
+        # K-means 구간 결정
         
         # K-means는 학습 때 log 스케일 매출 기준으로 4구간으로 나눴음
         # → 예측 시에도 동일하게 log 매출 기준으로 구간 결정
@@ -97,8 +188,11 @@ def predict_sales(data: SalesInput) -> SalesOutput:
         raw_cluster = int(kmeans.predict(log_sales)[0])
         cluster_mapping = {int(k): v for k, v in config["cluster_mapping"].items()}
         segment = cluster_mapping.get(raw_cluster, raw_cluster)
+        
+        # SHAP 결과 top N 정리
+        top_sales_factors = _get_top_sales_factors(X, segment)
 
-        # STEP 4. LightGBM 소프트 보팅 예측
+        # LightGBM 소프트 보팅 예측
 
         # lgb_clf: 4개 구간에 속할 확률 반환 (합계 = 1.0)
         # 소프트 보팅: 각 구간 예측값 × 해당 구간 확률 → 가중합
@@ -109,21 +203,21 @@ def predict_sales(data: SalesInput) -> SalesOutput:
             for seg in range(4)
         )
 
-        # STEP 5. XGBoost 확정 구간 예측
+        # XGBoost 확정 구간 예측
     
         # XGBoost는 K-means로 확정된 구간의 모델만 사용
         # (소프트 보팅 없이 단일 구간 예측)
         xgb_input = xgb.DMatrix(X, enable_categorical=True)
         xgb_pred_log = float(xgb_reg[segment].predict(xgb_input)[0])
 
-        # STEP 6. 앙상블 + 역변환
+        # 앙상블 + 역변환
         
         # log 스케일에서 가중 평균 후 expm1으로 원금액 복원
         # LGB 0.25 + XGB 0.75 (학습 시 최적 가중치)
         ensemble_log = LGB_WEIGHT * lgb_pred_log + XGB_WEIGHT * xgb_pred_log
         pred_sales = float(np.expm1(ensemble_log))
         
-        # STEP 7. 하한/상한 예외처리
+        # 하한/상한 예외처리
         
         # 학습 범위 밖 → 모델이 본 적 없는 데이터 → LOW
         # lower_bound: 100만원 (학습 시 하한 필터 기준)
@@ -133,6 +227,7 @@ def predict_sales(data: SalesInput) -> SalesOutput:
                 pred_sales=pred_sales,
                 segment=segment,
                 confidence="LOW",
+                top_sales_factors=top_sales_factors,
                 message="예측 매출이 너무 낮아(100만원 미만) 신뢰도가 낮습니다."
             )
 
@@ -141,14 +236,16 @@ def predict_sales(data: SalesInput) -> SalesOutput:
                 pred_sales=pred_sales,
                 segment=segment,
                 confidence="LOW",
+                top_sales_factors=top_sales_factors,
                 message="고매출 특수상권(4억 이상)으로 예측 신뢰도가 낮습니다."
             )
 
-        # STEP 8. 정상 반환
+        # 정상 반환
         return SalesOutput(
             pred_sales=pred_sales,
             segment=segment,
             confidence="HIGH",
+            top_sales_factors=top_sales_factors,
             message=None
         )
     except PredictionError:
