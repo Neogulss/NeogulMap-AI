@@ -5,9 +5,9 @@ import numpy as np
 import pandas as pd
 import xgboost as xgb
 
-from .exceptions import PredictionError
-from .risk_model_loader import risk_models
-from .schemas import RiskInput, RiskOutput
+from exceptions import PredictionError
+from risk_model_loader import risk_models
+from schemas import RiskInput, RiskOutput
 
 
 logger = logging.getLogger(__name__)
