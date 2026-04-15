@@ -3,7 +3,7 @@ import time
 from collections import OrderedDict
 from pathlib import Path
 from threading import Lock
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 import pymysql
 from openai import OpenAI
@@ -24,11 +24,39 @@ _POLICY_CHATBOT_FAISS_ID_MAP = None
 _POLICY_CHATBOT_FAISS_LOCK = Lock()
 _POLICY_CHATBOT_BM25 = None
 _POLICY_CHATBOT_BM25_DOCS = None
+_POLICY_CHATBOT_BM25_DOC_IDX_BY_CHUNK_ID = None
 _POLICY_CHATBOT_BM25_LOCK = Lock()
+
+MAX_EXPANDED_CONTENT_CHARS = int(
+    getattr(settings, "SEARCH_EXPANDED_CONTENT_MAX_CHARS", 2000)
+)
+MAX_LLM_CONTEXT_CHARS = int(
+    getattr(settings, "SEARCH_LLM_CONTEXT_MAX_CHARS", 4200)
+)
+
+SEOUL_DISTRICTS = {
+    "강남구", "강동구", "강북구", "강서구", "관악구",
+    "광진구", "구로구", "금천구", "노원구", "도봉구",
+    "동대문구", "동작구", "마포구", "서대문구", "서초구",
+    "성동구", "성북구", "송파구", "양천구", "영등포구",
+    "용산구", "은평구", "종로구", "중구", "중랑구",
+}
+SEOUL_WIDE_REGION_KEYWORDS = ["서울시", "서울특별시", "서울", "전국"]
+UNSELECTED_REGION_VALUES = {"", "미선택", "지역 미선택", "선택 안함", "선택안함", "전체", "전국"}
 
 
 def now_ms() -> int:
     return int(time.perf_counter() * 1000)
+
+
+def clip_text(text: str, max_chars: int) -> str:
+    if not text:
+        return ""
+    if max_chars <= 0:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 1] + "…"
 
 
 def initialize_policy_chatbot_resources() -> None:
@@ -67,14 +95,27 @@ def get_policy_chatbot_faiss():
 
 
 def get_policy_chatbot_bm25():
-    global _POLICY_CHATBOT_BM25, _POLICY_CHATBOT_BM25_DOCS
-    if _POLICY_CHATBOT_BM25 is None or _POLICY_CHATBOT_BM25_DOCS is None:
+    global _POLICY_CHATBOT_BM25, _POLICY_CHATBOT_BM25_DOCS, _POLICY_CHATBOT_BM25_DOC_IDX_BY_CHUNK_ID
+    if (
+        _POLICY_CHATBOT_BM25 is None
+        or _POLICY_CHATBOT_BM25_DOCS is None
+        or _POLICY_CHATBOT_BM25_DOC_IDX_BY_CHUNK_ID is None
+    ):
         with _POLICY_CHATBOT_BM25_LOCK:
-            if _POLICY_CHATBOT_BM25 is None or _POLICY_CHATBOT_BM25_DOCS is None:
+            if (
+                _POLICY_CHATBOT_BM25 is None
+                or _POLICY_CHATBOT_BM25_DOCS is None
+                or _POLICY_CHATBOT_BM25_DOC_IDX_BY_CHUNK_ID is None
+            ):
                 _POLICY_CHATBOT_BM25, _POLICY_CHATBOT_BM25_DOCS = data_indexing.load_bm25_index(
                     settings.INDEX_DIR
                 )
-    return _POLICY_CHATBOT_BM25, _POLICY_CHATBOT_BM25_DOCS
+                _POLICY_CHATBOT_BM25_DOC_IDX_BY_CHUNK_ID = {
+                    int(doc["chunk_id"]): idx
+                    for idx, doc in enumerate(_POLICY_CHATBOT_BM25_DOCS)
+                    if doc.get("chunk_id") is not None
+                }
+    return _POLICY_CHATBOT_BM25, _POLICY_CHATBOT_BM25_DOCS, _POLICY_CHATBOT_BM25_DOC_IDX_BY_CHUNK_ID
 
 
 def get_policy_chatbot_reranker() -> "PolicyChatbotReranker":
@@ -210,35 +251,35 @@ def classify_query(query: str, model: str = settings.CHAT_MODEL) -> str:
 
 def suggest_session_title(user_query: str, answer: str = "", model: str = settings.CHAT_MODEL) -> str:
     query = (user_query or "").strip().replace("\n", " ")
-    return query[:15] if query else "새 채팅"
+    return query if query else "새 채팅"
 
 
 def build_retrieval_query(user_query: str, user_profile: Optional[dict]) -> str:
-    parts = [f"사용자 질문: {user_query}"]
+    query = (user_query or "").strip()
+    if not user_profile:
+        return query
 
-    if user_profile:
-        industry = user_profile.get("industry")
-        age = user_profile.get("age")
-        has_business_registration = user_profile.get("has_business_registration")
-        region = user_profile.get("region")
+    parts = [query]
 
-        if industry:
-            parts.append(f"업종: {industry}")
-        if age is not None:
-            parts.append(f"나이: {age}세")
-            if age <= 39:
-                parts.append("청년 관련 조건 확인")
-            elif age >= 40:
-                parts.append("중장년 관련 조건 확인")
-        if has_business_registration is not None:
-            parts.append(
-                "사업자등록 있음" if has_business_registration else "사업자등록 없음"
-            )
-        if region:
-            parts.append(f"지역: {region}")
+    industry = user_profile.get("industry")
+    age = user_profile.get("age")
+    has_business_registration = user_profile.get("has_business_registration")
+    business_stage = user_profile.get("business_stage")
+    region = _normalize_region(user_profile.get("region"))
 
-    parts.append("지원대상, 신청자격, 나이 조건, 사업자등록 요건, 업종 요건, 지역 요건, 신청방법, 신청기간 중심으로 검색")
-    return "\n".join(parts)
+    if industry:
+        parts.append(f"업종:{industry}")
+    if age is not None:
+        parts.append(f"나이:{age}")
+    if has_business_registration is not None:
+        biz = "Y" if has_business_registration else "N"
+        parts.append(f"사업자등록:{biz}")
+    if business_stage:
+        parts.append(f"사업여부:{business_stage}")
+    if region:
+        parts.append(f"지역:{region}")
+
+    return " | ".join(parts)
 
 
 # =========================
@@ -343,9 +384,296 @@ def expand_result_to_parent_context(item: Dict) -> Dict:
     )
 
     expanded = dict(item)
-    expanded["expanded_content"] = merged_content
+    expanded["expanded_content"] = clip_text(merged_content, MAX_EXPANDED_CONTENT_CHARS)
     expanded["grouped_sections"] = merged_sections
     return expanded
+
+
+# =========================
+# Metadata pre-filter
+# =========================
+def _age_keywords(age: Optional[int]) -> List[str]:
+    if age is None:
+        return []
+    if age <= 39:
+        return ["청년", "39세 이하", "만 39세", "청년창업", "청년전용"]
+    return ["중장년", "40세 이상", "만 40세", "신중년"]
+
+
+def _business_stage_keywords(stage: Optional[str]) -> List[str]:
+    mapping = {
+        "예비창업": ["예비창업", "창업예정", "창업 준비", "미창업"],
+        "창업": ["기창업", "개인사업자", "법인사업자", "사업자"],
+        "재창업": ["재창업", "폐업", "재도전", "재기"],
+    }
+    return mapping.get(stage, [])
+
+
+def _normalize_region(region: Optional[str]) -> str:
+    region = (region or "").strip()
+    if region in UNSELECTED_REGION_VALUES:
+        return ""
+    return region
+
+
+def _has_region_selection(user_profile: Optional[dict]) -> bool:
+    if not user_profile:
+        return False
+    raw_region = (user_profile.get("region") or "").strip()
+    return raw_region not in UNSELECTED_REGION_VALUES
+
+
+def _build_search_blob(item: Dict) -> str:
+    return " ".join([
+        str(item.get("title") or ""),
+        str(item.get("section") or ""),
+        str(item.get("parent_h1") or ""),
+        str(item.get("parent_h2") or ""),
+        str(item.get("content") or ""),
+        str(item.get("file_name") or ""),
+        str(item.get("source_path") or ""),
+    ])
+
+
+def _has_other_district(blob: str, region: Optional[str] = None) -> bool:
+    region = _normalize_region(region)
+    other_districts = SEOUL_DISTRICTS - {region}
+    return any(other_region in blob for other_region in other_districts)
+
+
+def _is_wide_region_blob(blob: str) -> bool:
+    return not _has_other_district(blob) and any(
+        keyword in blob for keyword in SEOUL_WIDE_REGION_KEYWORDS
+    )
+
+
+def _is_selected_region_blob(blob: str, region: str) -> bool:
+    return not _has_other_district(blob, region) and region in blob
+
+
+def _is_allowed_for_region(blob: str, region: Optional[str]) -> bool:
+    region = _normalize_region(region)
+    if region in blob:
+        return _is_selected_region_blob(blob, region)
+
+    return _is_wide_region_blob(blob)
+
+
+def _profile_match_count(item: Dict, user_profile: Optional[dict]) -> int:
+    if not user_profile:
+        return 0
+
+    blob = _build_search_blob(item)
+
+    score = 0
+    industry = user_profile.get("industry")
+    region = user_profile.get("region")
+    age = user_profile.get("age")
+    has_business_registration = user_profile.get("has_business_registration")
+    business_stage = user_profile.get("business_stage")
+
+    if industry and industry in blob:
+        score += 1
+    if region and region in blob:
+        score += 1
+    if age is not None and any(k in blob for k in _age_keywords(age)):
+        score += 1
+    if business_stage and any(k in blob for k in _business_stage_keywords(business_stage)):
+        score += 1
+
+    if has_business_registration is True and any(
+        k in blob for k in ["사업자등록", "개인사업자", "법인사업자", "사업자"]
+    ):
+        score += 1
+    if has_business_registration is False and any(
+        k in blob for k in ["예비창업", "사업자등록 전", "미등록", "창업예정"]
+    ):
+        score += 1
+
+    return score
+
+
+def apply_profile_prefilter(results: List[Dict], user_profile: Optional[dict]) -> List[Dict]:
+    if not results or not user_profile:
+        return results
+
+    scored = []
+    for item in results:
+        match_count = _profile_match_count(item, user_profile)
+        new_item = dict(item)
+        new_item["profile_match_count"] = match_count
+        scored.append(new_item)
+
+    filtered = [x for x in scored if x["profile_match_count"] > 0]
+    target = filtered if filtered else scored
+    target.sort(key=lambda x: x["profile_match_count"], reverse=True)
+    return target
+
+
+def _build_profile_filter_keywords(user_profile: Optional[dict]) -> List[str]:
+    if not user_profile:
+        return []
+
+    keywords: List[str] = []
+    industry = user_profile.get("industry")
+    age = user_profile.get("age")
+    has_business_registration = user_profile.get("has_business_registration")
+    business_stage = user_profile.get("business_stage")
+
+    if industry:
+        keywords.append(str(industry))
+    if age is not None:
+        keywords.extend(_age_keywords(age))
+    if business_stage:
+        keywords.extend(_business_stage_keywords(business_stage))
+    if has_business_registration is True:
+        keywords.extend(["사업자등록", "개인사업자", "법인사업자"])
+    elif has_business_registration is False:
+        keywords.extend(["예비창업", "사업자등록 전", "미등록", "창업예정"])
+
+    # 길이 2 이상 키워드만 사용하고, 중복 제거
+    deduped = []
+    seen = set()
+    for k in keywords:
+        k = (k or "").strip()
+        if len(k) < 2 or k in seen:
+            continue
+        seen.add(k)
+        deduped.append(k)
+    return deduped
+
+
+def fetch_region_allowed_chunk_ids(user_profile: Optional[dict], limit: int = 3000) -> Optional[Set[int]]:
+    if not user_profile:
+        return None
+
+    region = _normalize_region(user_profile.get("region"))
+    has_region_selection = _has_region_selection(user_profile)
+
+    conn = None
+    try:
+        conn = get_connection()
+        with conn.cursor() as cursor:
+            keywords = [*SEOUL_WIDE_REGION_KEYWORDS]
+            if region:
+                keywords.insert(0, region)
+
+            where_parts = []
+            params: List[str] = []
+
+            for kw in keywords:
+                like_kw = f"%{kw}%"
+                where_parts.append(
+                    "("
+                    "d.TITLE LIKE %s OR "
+                    "d.FILE_NAME LIKE %s OR "
+                    "d.SOURCE_PATH LIKE %s OR "
+                    "c.SECTION LIKE %s OR "
+                    "c.PARENT_H1 LIKE %s OR "
+                    "c.PARENT_H2 LIKE %s OR "
+                    "c.CONTENT LIKE %s"
+                    ")"
+                )
+                params.extend([like_kw, like_kw, like_kw, like_kw, like_kw, like_kw, like_kw])
+
+            sql = f"""
+                SELECT
+                    c.CHUNKS_ID AS chunk_id,
+                    c.SECTION AS section,
+                    c.PARENT_H1 AS parent_h1,
+                    c.PARENT_H2 AS parent_h2,
+                    c.CONTENT AS content,
+                    d.TITLE AS title,
+                    d.FILE_NAME AS file_name,
+                    d.SOURCE_PATH AS source_path
+                FROM CHATBOT_DATA_CHUNKS c
+                JOIN CHATBOT_DOCUMENTS d
+                  ON c.DOCUMENT_ID = d.DOCUMENT_ID
+                WHERE {" OR ".join(where_parts)}
+                ORDER BY c.CHUNKS_ID ASC
+                LIMIT %s
+            """
+            params.append(int(limit))
+            cursor.execute(sql, params)
+            rows = cursor.fetchall()
+
+            selected_region_ids: Set[int] = set()
+            wide_region_ids: Set[int] = set()
+
+            for row in rows:
+                if row.get("chunk_id") is None:
+                    continue
+
+                chunk_id = int(row["chunk_id"])
+                blob = _build_search_blob(row)
+
+                if region and _is_selected_region_blob(blob, region):
+                    selected_region_ids.add(chunk_id)
+                elif _is_wide_region_blob(blob):
+                    wide_region_ids.add(chunk_id)
+
+            if has_region_selection and selected_region_ids:
+                return selected_region_ids
+
+            return wide_region_ids
+
+    except Exception as e:
+        logging.exception("[ERROR] fetch_region_allowed_chunk_ids 실패: %s", e)
+        return set()
+
+    finally:
+        if conn:
+            conn.close()
+
+
+def fetch_candidate_chunk_ids(user_profile: Optional[dict], limit: int = 3000) -> Optional[Set[int]]:
+    keywords = _build_profile_filter_keywords(user_profile)
+    if not keywords:
+        return None
+
+    conn = None
+    try:
+        conn = get_connection()
+        with conn.cursor() as cursor:
+            where_parts = []
+            params: List[str] = []
+            for kw in keywords:
+                like_kw = f"%{kw}%"
+                where_parts.append(
+                    "("
+                    "d.TITLE LIKE %s OR "
+                    "c.SECTION LIKE %s OR "
+                    "c.PARENT_H1 LIKE %s OR "
+                    "c.PARENT_H2 LIKE %s OR "
+                    "c.CONTENT LIKE %s"
+                    ")"
+                )
+                params.extend([like_kw, like_kw, like_kw, like_kw, like_kw])
+
+            sql = f"""
+                SELECT c.CHUNKS_ID AS chunk_id
+                FROM CHATBOT_DATA_CHUNKS c
+                JOIN CHATBOT_DOCUMENTS d
+                  ON c.DOCUMENT_ID = d.DOCUMENT_ID
+                WHERE {" OR ".join(where_parts)}
+                ORDER BY c.CHUNKS_ID ASC
+                LIMIT %s
+            """
+            params.append(int(limit))
+            cursor.execute(sql, params)
+            rows = cursor.fetchall()
+            candidate_ids = {int(row["chunk_id"]) for row in rows if row.get("chunk_id") is not None}
+            if not candidate_ids:
+                return None
+            return candidate_ids
+
+    except Exception as e:
+        logging.exception("[ERROR] fetch_candidate_chunk_ids 실패: %s", e)
+        return None
+
+    finally:
+        if conn:
+            conn.close()
 
 
 # =========================
@@ -387,15 +715,22 @@ class PolicyChatbotReranker:
 # =========================
 # Search
 # =========================
-def semantic_search(query: str, top_k: int = 10) -> List[Dict]:
+def semantic_search(query: str, top_k: int = 10, allowed_chunk_ids: Optional[Set[int]] = None) -> List[Dict]:
     try:
+        if allowed_chunk_ids is not None and not allowed_chunk_ids:
+            return []
+
         embedder = get_policy_chatbot_embedder()
         index, id_map = get_policy_chatbot_faiss()
 
         qvec = embedder.embed_query(query)
         qvec = data_indexing.normalize(qvec)
 
-        scores, indices = index.search(qvec, top_k)
+        search_k = top_k
+        if allowed_chunk_ids is not None:
+            search_k = len(id_map)
+
+        scores, indices = index.search(qvec, search_k)
 
         candidate_ids = []
         score_map = {}
@@ -404,8 +739,14 @@ def semantic_search(query: str, top_k: int = 10) -> List[Dict]:
             if idx == -1:
                 continue
             chunk_id = id_map[idx]
+            if allowed_chunk_ids is not None and chunk_id not in allowed_chunk_ids:
+                continue
+            if chunk_id in score_map:
+                continue
             candidate_ids.append(chunk_id)
             score_map[chunk_id] = float(score)
+            if len(candidate_ids) >= top_k:
+                break
 
         chunk_map = fetch_chunks_by_ids(candidate_ids)
 
@@ -434,18 +775,39 @@ def semantic_search(query: str, top_k: int = 10) -> List[Dict]:
         return []
 
 
-def bm25_search(query: str, top_k: int = 10) -> List[Dict]:
+def bm25_search(query: str, top_k: int = 10, allowed_chunk_ids: Optional[Set[int]] = None) -> List[Dict]:
     try:
-        bm25, docs = get_policy_chatbot_bm25()
+        if allowed_chunk_ids is not None and not allowed_chunk_ids:
+            return []
+
+        bm25, docs, doc_idx_by_chunk_id = get_policy_chatbot_bm25()
 
         query_tokens = data_indexing.bm25_tokenize(query)
-        scores = bm25.get_scores(query_tokens)
+        if allowed_chunk_ids is not None:
+            allowed_doc_indices = [
+                doc_idx_by_chunk_id[chunk_id]
+                for chunk_id in allowed_chunk_ids
+                if chunk_id in doc_idx_by_chunk_id
+            ]
+            if not allowed_doc_indices:
+                return []
 
-        ranked = sorted(
-            zip(docs, scores),
-            key=lambda x: x[1],
-            reverse=True
-        )[:top_k]
+            batch_scores = bm25.get_batch_scores(query_tokens, allowed_doc_indices)
+            ranked = sorted(
+                (
+                    (docs[doc_idx], score)
+                    for doc_idx, score in zip(allowed_doc_indices, batch_scores)
+                ),
+                key=lambda x: x[1],
+                reverse=True
+            )[:top_k]
+        else:
+            scores = bm25.get_scores(query_tokens)
+            ranked = sorted(
+                zip(docs, scores),
+                key=lambda x: x[1],
+                reverse=True
+            )[:top_k]
 
         results = []
         for doc, score in ranked:
@@ -515,10 +877,33 @@ def rrf_fusion(semantic_results: List[Dict], bm25_results: List[Dict], k: int = 
     return fused
 
 
-def hybrid_search(query: str) -> List[Dict]:
+def hybrid_search(query: str, user_profile: Optional[dict] = None) -> List[Dict]:
     try:
-        semantic_results = semantic_search(query, top_k=settings.SEARCH_SEMANTIC_TOP_K)
-        bm25_results = bm25_search(query, top_k=settings.SEARCH_BM25_TOP_K)
+        prefilter_limit = int(getattr(settings, "SEARCH_PREFILTER_MAX_CANDIDATES", 3000))
+        profile_candidate_ids = fetch_candidate_chunk_ids(user_profile, limit=prefilter_limit)
+        region_allowed_ids = fetch_region_allowed_chunk_ids(user_profile, limit=prefilter_limit)
+
+        allowed_chunk_ids = profile_candidate_ids
+        if region_allowed_ids is not None:
+            allowed_chunk_ids = (
+                region_allowed_ids
+                if allowed_chunk_ids is None
+                else allowed_chunk_ids & region_allowed_ids
+            )
+
+        semantic_results = semantic_search(
+            query,
+            top_k=settings.SEARCH_SEMANTIC_TOP_K,
+            allowed_chunk_ids=allowed_chunk_ids,
+        )
+        bm25_results = bm25_search(
+            query,
+            top_k=settings.SEARCH_BM25_TOP_K,
+            allowed_chunk_ids=allowed_chunk_ids,
+        )
+
+        semantic_results = apply_profile_prefilter(semantic_results, user_profile)
+        bm25_results = apply_profile_prefilter(bm25_results, user_profile)
 
         if not semantic_results and not bm25_results:
             return []
@@ -553,8 +938,11 @@ def build_user_context_text(user_profile: Optional[dict]) -> str:
         lines.append(
             f"- 사업자등록 여부: {'있음' if user_profile['has_business_registration'] else '없음'}"
         )
-    if user_profile.get("region"):
-        lines.append(f"- 지역: {user_profile['region']}")
+    if user_profile.get("business_stage"):
+        lines.append(f"- 사업여부: {user_profile['business_stage']}")
+    region = _normalize_region(user_profile.get("region"))
+    if region:
+        lines.append(f"- 지역: {region}")
 
     return "\n".join(lines) if lines else "사용자 추가 정보 없음"
 
@@ -562,9 +950,16 @@ def build_user_context_text(user_profile: Optional[dict]) -> str:
 def build_context_from_results(results: List[Dict], max_items: int = 5) -> str:
     selected = results[:max_items]
     parts = []
+    current_len = 0
 
     for i, item in enumerate(selected, start=1):
-        content_for_answer = item.get("expanded_content") or item.get("content", "")
+        if current_len >= MAX_LLM_CONTEXT_CHARS:
+            break
+
+        content_for_answer = clip_text(
+            item.get("expanded_content") or item.get("content", ""),
+            MAX_EXPANDED_CONTENT_CHARS,
+        )
 
         part = (
             f"[문서 {i}]\n"
@@ -576,21 +971,29 @@ def build_context_from_results(results: List[Dict], max_items: int = 5) -> str:
             f"rerank_score: {item.get('rerank_score')}\n"
             f"내용:\n{content_for_answer}\n"
         )
+
+        remaining = MAX_LLM_CONTEXT_CHARS - current_len
+        if remaining <= 0:
+            break
+        part = clip_text(part, remaining)
         parts.append(part)
+        current_len += len(part) + 2
 
     return "\n\n".join(parts)
 
 
 def build_service_intro_prompt(user_query: str, item: dict) -> str:
-    content_for_answer = item.get("expanded_content", item["content"])
+    content_for_answer = clip_text(
+        item.get("expanded_content", item["content"]),
+        MAX_LLM_CONTEXT_CHARS,
+    )
 
     return f"""
-    역할: 너는 ‘입지너구리’ 서비스 소개 챗봇이다.
+    역할: 너는 ‘입지너구리’ 서비스 소개 챗봇이다. 사용자가 ‘입지너구리’ 서비스에 대해 궁금해하는 질문에 답변한다.
 
     규칙:
     - 반드시 [문서 내용]에 있는 정보만 사용해 답변한다.
     - 문서에 없는 내용은 추측하거나 생성하지 않는다.
-    - 문서에 해당 정보가 없으면 "문서상 확인되지 않음"이라고 답한다.
     - 사용자 질문과 관련된 내용만 간결하게 설명한다.
     - 말투는 항상 친절한 한국어로 작성한다. ("~이에요", "~가 있어요", "~할 수 있어요")
     - 큰 항목은 **굵게** 표시한다.
@@ -615,21 +1018,23 @@ def build_multi_result_prompt(user_query: str, user_profile: Optional[dict], res
     profile_text = build_user_context_text(user_profile)
 
     return f"""
-    역할: 너는 한국의 정부지원정책, 창업지원, 정책자금, 대출 정보를 안내하는 한국어 챗봇이다.
+    역할: 너는 한국의 정부지원정책, 창업지원, 정책자금, 대출 정보를 소상공인에게 안내하는 한국어 챗봇이다.
 
     규칙:
     - 반드시 [검색 결과 문서]에 있는 내용만 사용해 답변한다.
     - 문서에 없는 내용은 추측하거나 생성하지 않는다.
     - [사용자 추가 정보]가 있으면 문서의 지원대상, 신청조건, 자격요건과 비교해 적합 여부를 설명한다.
+    - "문서에는 ~"과 같이 문서를 근거로 한다는 문장은 사용하지 않는다.
     - 사용자와 더 잘 맞는 정책/상품을 우선 소개한다.
-    - 적합한 이유는 문서 근거에 따라 짧고 분명하게 설명한다.
+    - 사용자에게 적합하지 않는 정책/상품은 제외한다.
+    - 적합한 이유는 문서의 내용을 근거로 짧고 분명하게 설명한다.
     - 문서에 없는 조건은 판단하지 말고 "추가 확인이 필요해요"라고 답한다.
     - 말투는 친절한 한국어로 작성한다. ("~이에요", "~가 있어요", "~할 수 있어요")
     - 정책명/상품명은 **굵게** 표시한다.
     - 필요할 때만 "---"로 구분한다.
     - 중요한 내용에는 이모티콘을 적절히 사용할 수 있다.
-    - URL은 실제로 유효한 주소가 문서에 있는 경우에만 마지막에 "🔗 자세히 보기: URL" 형식으로 포함한다.
-    - URL 값이 "없음", "데이터 없음", "null", "None", 공백, 빈 문자열처럼 실질적으로 주소가 없는 경우에는 URL 문구 자체를 출력하지 않는다.
+    - URL은 문서에 실제 url이 있는 경우에만 마지막에 "🔗 자세히 보기: URL" 형식으로 포함한다.
+    - 값이 "없음", "데이터 없음", "null", "None", 공백, 빈 문자열처럼 실질적으로 값이 없는 경우에는 출력하지 않는다.
     - 답변 마지막에 추가 질문 유도, 다음 단계 제안은 쓰지 않는다.
     - "원하시면 ~", "추가로 ~ 도와드릴 수 있어요" 같은 문장은 금지한다.
 
@@ -748,11 +1153,18 @@ def answer_policy_chatbot_query(request: PolicyChatbotAskRequest) -> dict:
         retrieval_query = build_retrieval_query(user_query, user_profile)
 
         retrieval_start = now_ms()
-        results = hybrid_search(retrieval_query)
+        results = hybrid_search(retrieval_query, user_profile=user_profile)
         retrieval_ms = now_ms() - retrieval_start
 
         if not results:
-            answer = "관련된 정책 또는 대출 문서를 찾지 못했어요. 질문을 조금 더 구체적으로 적어주시면 도움이 될 수 있어요."
+            region = _normalize_region(user_profile.get("region") if user_profile else None)
+            if region:
+                answer = (
+                    f"{region} 또는 서울시/전국 단위로 적용 가능한 정책·대출 문서를 찾지 못했어요. "
+                    "현재 등록된 문서 기준으로는 해당 지역에 맞는 결과가 없습니다."
+                )
+            else:
+                answer = "관련된 정책 또는 대출 문서를 찾지 못했어요. 질문을 조금 더 구체적으로 적어주시면 도움이 될 수 있어요."
             title = suggest_session_title(user_query, answer)
             turn_latency_ms = now_ms() - turn_start
 

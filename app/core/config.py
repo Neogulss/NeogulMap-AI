@@ -11,7 +11,7 @@ class Settings(BaseSettings):
     OPENAI_API_KEY: str
 
     CHAT_MODEL: str = "gpt-5.4-mini"
-    RERANK_MODEL: str = "BAAI/bge-reranker-v2-m3"
+    RERANK_MODEL: str = "cross-encoder/ms-marco-MiniLM-L6-v2"
     EMBED_MODEL: str = "text-embedding-3-small"
 
     MYSQL_HOST: str
@@ -27,11 +27,13 @@ class Settings(BaseSettings):
 
     BACKEND_CORS_ORIGINS: list[str] = Field(default_factory=lambda: ["*"])
 
-    SEARCH_SEMANTIC_TOP_K: int = 20
-    SEARCH_BM25_TOP_K: int = 20
-    SEARCH_FUSED_TOP_K: int = 20
-    SEARCH_RERANK_TOP_K: int = 3
-    SEARCH_RESPONSE_TOP_K: int = 3
+    SEARCH_SEMANTIC_TOP_K: int = 12
+    SEARCH_BM25_TOP_K: int = 12
+    SEARCH_FUSED_TOP_K: int = 8
+    SEARCH_RERANK_TOP_K: int = 2
+    SEARCH_RESPONSE_TOP_K: int = 2
+    SEARCH_PREFILTER_MAX_CANDIDATES: int = 1500
+    CHAT_MAX_OUTPUT_TOKENS: int = 380
 
 
     model_config = SettingsConfigDict(
