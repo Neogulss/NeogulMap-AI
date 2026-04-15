@@ -28,7 +28,7 @@ def _bootstrap_local_app_package() -> None:
 _bootstrap_local_app_package()
 
 from app.schema.policy_chatbot_schema import PolicyChatbotAskRequest, UserProfileInput
-from app.service.policy_chatbot.chat_app import answer_policy_chatbot_query
+from app.service.policy_chatbot.chat_app import answer_policy_chatbot_query, build_retrieval_query
 
 
 st.set_page_config(page_title="Policy Chatbot Test", layout="wide")
@@ -42,12 +42,17 @@ query = st.text_area(
     height=120,
 )
 
-gu_options = ["금천구", "영등포구", "구로구", "관악구", "동작구", "서초구", "강남구", "마포구", "용산구", "성동구", "광진구", "중구", "종로구", "성북구", "강북구", "도봉구", "노원구", "은평구", "강서구", "양천구", "중랑구", "동대문구", "서대문구", "강동구", "송파구"]
-col1, col2, col3, col4 = st.columns(4)
+gu_options = ["미입력", "금천구", "영등포구", "구로구", "관악구", "동작구", "서초구", "강남구", "마포구", "용산구", "성동구", "광진구", "중구", "종로구", "성북구", "강북구", "도봉구", "노원구", "은평구", "강서구", "양천구", "중랑구", "동대문구", "서대문구", "강동구", "송파구"]
+col1, col2, col3, col4, col5 = st.columns(5)
 industry = col1.text_input("업종", value="한식음식점")
 age_input = col2.text_input("나이", value="35")
 biz = col3.selectbox("사업자등록여부", options=["미입력", "있음", "없음"], index=1)
-gu = col4.selectbox("지역", options=gu_options, index=gu_options.index("금천구"))
+gu = col4.selectbox("지역", options=gu_options, index=1)
+business_stage = col5.selectbox(
+    "사업여부",
+    options=["미입력", "예비창업", "창업", "재창업"],
+    index=2,
+)
 
 session_idx_input = st.text_input("session_idx (선택)", value="")
 
@@ -69,8 +74,16 @@ if st.button("테스트 실행", type="primary"):
         industry=industry or None,
         age=age,
         has_business_registration=has_business_registration,
-        gu = gu
+        business_stage=business_stage if business_stage != "미입력" else None,
+        region=gu
     )
+
+    profile_dict = user_profile.model_dump() if user_profile else None
+    retrieval_query = build_retrieval_query(query.strip(), profile_dict)
+
+    st.subheader("build_retrieval_query 결과")
+    st.code(retrieval_query)
+
 
     request = PolicyChatbotAskRequest(
         user_query=query.strip(),
