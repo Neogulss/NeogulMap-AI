@@ -3,9 +3,9 @@ import pandas as pd
 import xgboost as xgb
 import logging
 
-from .sales_model_loader import sales_models
-from .schemas import SalesInput, SalesOutput
-from .exceptions import PredictionError
+from sales_model_loader import sales_models
+from schemas import SalesInput, SalesOutput
+from exceptions import PredictionError
 
 # 예외 처리
 logger = logging.getLogger(__name__)
