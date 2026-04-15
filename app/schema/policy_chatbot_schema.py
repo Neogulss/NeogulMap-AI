@@ -10,6 +10,7 @@ class UserProfileInput(BaseModel):
         description="사업자등록 여부"
     )
     region: Optional[str] = Field(default=None, description="지역")
+    startup_status: Optional[str] = Field(default=None, description="창업 상태")
     
     
 class PolicyChatbotAskRequest(BaseModel):

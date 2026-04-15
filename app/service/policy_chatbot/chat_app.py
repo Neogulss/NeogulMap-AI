@@ -221,6 +221,7 @@ def build_retrieval_query(user_query: str, user_profile: Optional[dict]) -> str:
         age = user_profile.get("age")
         has_business_registration = user_profile.get("has_business_registration")
         region = user_profile.get("region")
+        startup_status = user_profile.get("startup_status")
 
         if industry:
             parts.append(f"업종: {industry}")
@@ -236,8 +237,10 @@ def build_retrieval_query(user_query: str, user_profile: Optional[dict]) -> str:
             )
         if region:
             parts.append(f"지역: {region}")
+        if startup_status:
+            parts.append(f"창업 상태: {startup_status}")
 
-    parts.append("지원대상, 신청자격, 나이 조건, 사업자등록 요건, 업종 요건, 지역 요건, 신청방법, 신청기간 중심으로 검색")
+    parts.append("지원대상, 신청자격, 나이 조건, 사업자등록 요건, 업종 요건, 지역 요건, 창업 단계(예비/운영/재창업) 요건, 신청방법, 신청기간 중심으로 검색")
     return "\n".join(parts)
 
 
@@ -555,6 +558,8 @@ def build_user_context_text(user_profile: Optional[dict]) -> str:
         )
     if user_profile.get("region"):
         lines.append(f"- 지역: {user_profile['region']}")
+    if user_profile.get("startup_status"):
+        lines.append(f"- 창업 상태: {user_profile['startup_status']}")
 
     return "\n".join(lines) if lines else "사용자 추가 정보 없음"
 
