@@ -1,0 +1,73 @@
+{
+  "final_model": "B-1",
+  "ensemble_strategy": "lgb_soft_xgb",
+  "best_w_soft": 0.25,
+  "lower_bound": 1000000.0,
+  "target_lower_bound": 1000000.0,
+  "k": 4,
+  "cluster_mapping": {
+    "2": 0,
+    "0": 1,
+    "3": 2,
+    "1": 3
+  },
+  "features": [
+    "기준_분기_코드",
+    "행정동_코드",
+    "서비스_업종_코드",
+    "sales_lag1_log",
+    "sales_lag2_log",
+    "sales_lag3_log",
+    "sales_lag4_log",
+    "sales_ma2",
+    "sales_ma3",
+    "sales_std2",
+    "sales_std3",
+    "sales_growth_1q",
+    "sales_vs_ma3",
+    "매출_증감률",
+    "매출_대비_업종평균_비율",
+    "점포_수",
+    "유사_업종_점포_수",
+    "franchise_ratio",
+    "경쟁_밀도",
+    "competition_ratio",
+    "영역_면적",
+    "floating_population_per_store",
+    "유동인구_밀도",
+    "young_pop_ratio",
+    "weekend_pop_ratio",
+    "log_총_유동인구_수",
+    "월_평균_소득_금액",
+    "음식_지출_비율",
+    "유흥_지출_비율",
+    "교육_지출_비율",
+    "여가문화_지출_비율",
+    "유사_업종_점포_수_lag1",
+    "유사_업종_점포_수_변화_량",
+    "폐업_률_변화_량",
+    "총_유동인구_수_lag1",
+    "유동인구_변화_량"
+  ],
+  "cat_cols": [
+    "행정동_코드",
+    "서비스_업종_코드"
+  ],
+  "exclude_cols": [
+    "target_per_store_log",
+    "target_next",
+    "점포당_매출",
+    "sales_log",
+    "sales_group",
+    "기준_년분기_코드",
+    "행정동_코드_명",
+    "서비스_업종_코드_명"
+  ],
+  "valid_scores": {
+    "MdAPE": 13.4221,
+    "MAE": 3450179.0,
+    "RMSE": 10135402.0,
+    "R2": 0.919
+  },
+  "note": "valid 기준 수치 — 실제 성능은 약간 낮을 수 있음"
+}
