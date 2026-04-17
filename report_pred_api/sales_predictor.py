@@ -173,7 +173,8 @@ def predict_sales(data: SalesInput) -> SalesOutput:
                 segment=-1,
                 confidence="LOW",
                 top_sales_factors=None,
-                message="점포 수가 적어 예측 신뢰도가 낮습니다."
+                message="점포 수가 적어 예측 신뢰도가 낮습니다.",
+                sales_ai_response=None 
             )
 
         # 입력 전처리
@@ -228,7 +229,8 @@ def predict_sales(data: SalesInput) -> SalesOutput:
                 segment=segment,
                 confidence="LOW",
                 top_sales_factors=top_sales_factors,
-                message="예측 매출이 너무 낮아(100만원 미만) 신뢰도가 낮습니다."
+                message="예측 매출이 너무 낮아(100만원 미만) 신뢰도가 낮습니다.",
+                sales_ai_response=None 
             )
 
         if pred_sales > config["upper_bound"]:
@@ -237,7 +239,8 @@ def predict_sales(data: SalesInput) -> SalesOutput:
                 segment=segment,
                 confidence="LOW",
                 top_sales_factors=top_sales_factors,
-                message="고매출 특수상권(4억 이상)으로 예측 신뢰도가 낮습니다."
+                message="고매출 특수상권(4억 이상)으로 예측 신뢰도가 낮습니다.",
+                sales_ai_response=None 
             )
 
         # 정상 반환
@@ -246,7 +249,8 @@ def predict_sales(data: SalesInput) -> SalesOutput:
             segment=segment,
             confidence="HIGH",
             top_sales_factors=top_sales_factors,
-            message=None
+            message=None,
+            sales_ai_response=None       
         )
     except PredictionError:
         raise
