@@ -21,7 +21,7 @@ __pycache__/
 .ruff_cache/
 
 # 예측 모델 파일(saved_sales_models)
-report_pred_api/saved_sales_models/
+# report_pred_api/saved_sales_models/
 
 # 리스크 모델 파일(saved_risk_models)
-report_pred_api/saved_risk_models/
+# report_pred_api/saved_risk_models/
