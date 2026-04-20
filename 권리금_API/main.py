@@ -40,6 +40,20 @@ stats_upjong     = payload['stats_upjong']
 upjong_code_dict = payload['upjong_code_dict']
 SEOUL_TO_JOMPO   = payload['SEOUL_TO_JOMPO']
 
+# 깨진 행정동명 복원 딕셔너리
+DONG_FIX = {
+    '금호2?3가동':      '금호2·3가동',
+    '면목3?8동':        '면목3·8동',
+    '상계3?4동':        '상계3·4동',
+    '상계6?7동':        '상계6·7동',
+    '종로1?2?3?4가동':  '종로1·2·3·4가동',
+    '종로5?6가동':      '종로5·6가동',
+    '중계2?3동':        '중계2·3동',
+}
+
+def fix_dong_name(name):
+    return DONG_FIX.get(name, name)
+
 # 행정동 좌표 CSV
 coord_df   = pd.read_csv('행정동_좌표.csv', encoding='utf-8-sig')
 coord_dict = coord_df.set_index('hdong').to_dict('index')
@@ -203,15 +217,15 @@ def recommend(req: RecommendRequest):
         district_name = str(info.get('자치구명', ''))
 
         results.append(DongResult(
-            adminDongCode           = str(info.get('행정동_코드', '')),
-            adminDongName           = c['hdong'],
-            districtCode            = district_code,
-            districtName            = district_name,
-            longitude               = info.get('longitude'),
-            latitude                = info.get('latitude'),
-            serviceIndustryCode     = industry_code,
-            serviceIndustryCodeName = req.service_type,
-            estimatedCost           = c['display'],
-        ))
+    adminDongCode           = str(info.get('행정동_코드', '')),
+    adminDongName           = fix_dong_name(c['hdong']),  # ← 수정
+    districtCode            = district_code,
+    districtName            = district_name,
+    longitude               = info.get('longitude'),
+    latitude                = info.get('latitude'),
+    serviceIndustryCode     = industry_code,
+    serviceIndustryCodeName = req.service_type,
+    estimatedCost           = c['display'],
+))
 
     return RecommendResponse(results=results)
