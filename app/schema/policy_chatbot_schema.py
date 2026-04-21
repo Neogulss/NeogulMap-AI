@@ -9,6 +9,10 @@ class UserProfileInput(BaseModel):
         default=None,
         description="사업자등록 여부"
     )
+    business_stage: Optional[Literal["예비창업", "창업", "재창업"]] = Field(
+        default=None,
+        description="사업여부(예비창업/창업/재창업)"
+    )
     region: Optional[str] = Field(default=None, description="지역")
     startup_status: Optional[str] = Field(default=None, description="창업 상태")
     

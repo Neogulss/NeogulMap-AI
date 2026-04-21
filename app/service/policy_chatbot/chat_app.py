@@ -177,11 +177,7 @@ def classify_query(query: str, model: str = settings.CHAT_MODEL) -> str:
 
     service_keywords = [
         "입지너구리",
-        "서비스",
-        "기능",
-        "사용법",
-        "어떻게 써",
-        "플랫폼",
+        "입지 너구리",
     ]
     policy_keywords = [
         "정책",
@@ -196,6 +192,8 @@ def classify_query(query: str, model: str = settings.CHAT_MODEL) -> str:
         "상환",
         "창업",
         "소상공인",
+        "교육",
+        "프로그램",
     ]
 
     has_service = any(k in q for k in service_keywords)
@@ -390,7 +388,11 @@ class PolicyChatbotReranker:
 # =========================
 # Search
 # =========================
-def semantic_search(query: str, top_k: int = 10) -> List[Dict]:
+def semantic_search(
+    query: str,
+    top_k: int = 10,
+    exclude_service_intro: bool = False,
+) -> List[Dict]:
     try:
         embedder = get_policy_chatbot_embedder()
         index, id_map = get_policy_chatbot_faiss()
@@ -417,6 +419,8 @@ def semantic_search(query: str, top_k: int = 10) -> List[Dict]:
             chunk = chunk_map.get(chunk_id)
             if not chunk:
                 continue
+            if exclude_service_intro and chunk["file_name"] == "입지너구리_서비스소개.md":
+                continue
             results.append({
                 "chunk_id": chunk_id,
                 "document_id": chunk["document_id"],
@@ -437,7 +441,11 @@ def semantic_search(query: str, top_k: int = 10) -> List[Dict]:
         return []
 
 
-def bm25_search(query: str, top_k: int = 10) -> List[Dict]:
+def bm25_search(
+    query: str,
+    top_k: int = 10,
+    exclude_service_intro: bool = False,
+) -> List[Dict]:
     try:
         bm25, docs = get_policy_chatbot_bm25()
 
@@ -448,10 +456,12 @@ def bm25_search(query: str, top_k: int = 10) -> List[Dict]:
             zip(docs, scores),
             key=lambda x: x[1],
             reverse=True
-        )[:top_k]
+        )
 
         results = []
         for doc, score in ranked:
+            if exclude_service_intro and doc["file_name"] == "입지너구리_서비스소개.md":
+                continue
             results.append({
                 "chunk_id": doc["chunk_id"],
                 "document_id": doc["document_id"],
@@ -464,6 +474,8 @@ def bm25_search(query: str, top_k: int = 10) -> List[Dict]:
                 "source": doc["file_name"],
                 "bm25_score": float(score),
             })
+            if len(results) >= top_k:
+                break
 
         return results
 
@@ -524,10 +536,18 @@ def rrf_fusion(
     return fused
 
 
-def hybrid_search(query: str) -> List[Dict]:
+def hybrid_search(query: str, exclude_service_intro: bool = False) -> List[Dict]:
     try:
-        semantic_results = semantic_search(query, top_k=settings.SEARCH_SEMANTIC_TOP_K)
-        bm25_results = bm25_search(query, top_k=settings.SEARCH_BM25_TOP_K)
+        semantic_results = semantic_search(
+            query,
+            top_k=settings.SEARCH_SEMANTIC_TOP_K,
+            exclude_service_intro=exclude_service_intro,
+        )
+        bm25_results = bm25_search(
+            query,
+            top_k=settings.SEARCH_BM25_TOP_K,
+            exclude_service_intro=exclude_service_intro,
+        )
 
         if not semantic_results and not bm25_results:
             return []
@@ -603,15 +623,23 @@ def build_service_intro_prompt(user_query: str, item: dict) -> str:
 
     return f"""
     역할: 너는 ‘입지너구리’ 서비스 소개 챗봇이다.
+    아래와 같은 형식을 사용해 답변을 작성한다.
+
+    형식: 
+    **입지너구리란?**
+    입지너구리는 000입니다. (서비스의 핵심 가치와 특징을 간결하게 설명)
+    **주요 기능** 
+    (주요 기능에 대해 간략하게 설명)
+    **참고 사항**
+    (로그인/비로그인 여부에 따른 서비스 차이 간결하게 설명)
 
     규칙:
     - 반드시 [문서 내용]에 있는 정보만 사용해 답변한다.
     - 문서에 없는 내용은 추측하거나 생성하지 않는다.
-    - 문서에 해당 정보가 없으면 "문서상 확인되지 않음"이라고 답한다.
+    - "문서를 보면", "문서 기준으로", "문서에 나온걸 보면" 등등 문서에서 찾았다는 얘기는 절대 하지 않고, 그냥 아는 내용인 것처럼 얘기한다.
     - 사용자 질문과 관련된 내용만 간결하게 설명한다.
     - 말투는 항상 친절한 한국어로 작성한다. ("~이에요", "~가 있어요", "~할 수 있어요")
     - 큰 항목은 **굵게** 표시한다.
-    - 필요할 때만 "---"로 구분한다.
     - 중요한 내용에는 이모티콘을 적절히 사용할 수 있다.
     - 답변 마지막에 추가 제안, 선택지, 다음 단계 안내는 쓰지 않는다.
     - "원하시면 ~", "추가로 ~ 도와드릴 수 있어요" 같은 문장은 금지한다.
@@ -766,7 +794,10 @@ def answer_policy_chatbot_query(request: PolicyChatbotAskRequest) -> dict:
         retrieval_query = build_retrieval_query(user_query, user_profile)
 
         retrieval_start = now_ms()
-        results = hybrid_search(retrieval_query)
+        results = hybrid_search(
+            retrieval_query,
+            exclude_service_intro=(query_type == "policy_or_loan"),
+        )
         retrieval_ms = now_ms() - retrieval_start
 
         if not results:
