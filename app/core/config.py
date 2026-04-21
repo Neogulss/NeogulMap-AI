@@ -30,8 +30,11 @@ class Settings(BaseSettings):
     SEARCH_SEMANTIC_TOP_K: int = 15
     SEARCH_BM25_TOP_K: int = 15
     SEARCH_FUSED_TOP_K: int = 15
-    SEARCH_RERANK_TOP_K: int = 2
-    SEARCH_RESPONSE_TOP_K: int = 2
+    SEARCH_RERANK_TOP_K: int = 3
+    SEARCH_RESPONSE_TOP_K: int = 3
+    SEARCH_RRF_K: int = 60
+    SEARCH_SEMANTIC_WEIGHT: float = 1.0
+    SEARCH_BM25_WEIGHT: float = 1.0
 
 
     model_config = SettingsConfigDict(
