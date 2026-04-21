@@ -472,7 +472,13 @@ def bm25_search(query: str, top_k: int = 10) -> List[Dict]:
         return []
 
 
-def rrf_fusion(semantic_results: List[Dict], bm25_results: List[Dict], k: int = 60) -> List[Dict]:
+def rrf_fusion(
+    semantic_results: List[Dict],
+    bm25_results: List[Dict],
+    k: int = 60,
+    semantic_weight: float = 1.0,
+    bm25_weight: float = 1.0,
+) -> List[Dict]:
     merged = {}
 
     for rank, item in enumerate(semantic_results, start=1):
@@ -491,7 +497,7 @@ def rrf_fusion(semantic_results: List[Dict], bm25_results: List[Dict], k: int = 
             "bm25_score": None,
             "rrf_score": 0.0,
         })
-        merged[chunk_id]["rrf_score"] += 1.0 / (k + rank)
+        merged[chunk_id]["rrf_score"] += semantic_weight * (1.0 / (k + rank))
 
     for rank, item in enumerate(bm25_results, start=1):
         chunk_id = item["chunk_id"]
@@ -511,7 +517,7 @@ def rrf_fusion(semantic_results: List[Dict], bm25_results: List[Dict], k: int = 
         })
         if merged[chunk_id].get("bm25_score") is None:
             merged[chunk_id]["bm25_score"] = item.get("bm25_score")
-        merged[chunk_id]["rrf_score"] += 1.0 / (k + rank)
+        merged[chunk_id]["rrf_score"] += bm25_weight * (1.0 / (k + rank))
 
     fused = list(merged.values())
     fused.sort(key=lambda x: x["rrf_score"], reverse=True)
@@ -526,7 +532,13 @@ def hybrid_search(query: str) -> List[Dict]:
         if not semantic_results and not bm25_results:
             return []
 
-        fused = rrf_fusion(semantic_results, bm25_results)
+        fused = rrf_fusion(
+            semantic_results,
+            bm25_results,
+            k=settings.SEARCH_RRF_K,
+            semantic_weight=settings.SEARCH_SEMANTIC_WEIGHT,
+            bm25_weight=settings.SEARCH_BM25_WEIGHT,
+        )
         fused = fused[:settings.SEARCH_FUSED_TOP_K]
 
         reranker = get_policy_chatbot_reranker()
