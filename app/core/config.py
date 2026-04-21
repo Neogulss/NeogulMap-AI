@@ -33,7 +33,7 @@ class Settings(BaseSettings):
     SEARCH_RERANK_TOP_K: int = 3
     SEARCH_RESPONSE_TOP_K: int = 3
     SEARCH_RRF_K: int = 60
-    SEARCH_SEMANTIC_WEIGHT: float = 1.3
+    SEARCH_SEMANTIC_WEIGHT: float = 1.2
     SEARCH_BM25_WEIGHT: float = 1.0
 
 
