@@ -29,11 +29,12 @@ class Settings(BaseSettings):
 
     SEARCH_SEMANTIC_TOP_K: int = 12
     SEARCH_BM25_TOP_K: int = 12
-    SEARCH_FUSED_TOP_K: int = 8
-    SEARCH_RERANK_TOP_K: int = 2
-    SEARCH_RESPONSE_TOP_K: int = 2
-    SEARCH_PREFILTER_MAX_CANDIDATES: int = 1500
-    CHAT_MAX_OUTPUT_TOKENS: int = 380
+    SEARCH_FUSED_TOP_K: int = 12
+    SEARCH_RERANK_TOP_K: int = 3
+    SEARCH_RESPONSE_TOP_K: int = 3
+    SEARCH_RRF_K: int = 60
+    SEARCH_SEMANTIC_WEIGHT: float = 1.3
+    SEARCH_BM25_WEIGHT: float = 1.0
 
 
     model_config = SettingsConfigDict(
