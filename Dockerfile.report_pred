@@ -9,4 +9,5 @@ COPY report_pred_api /app/report_pred_api
 
 EXPOSE 8002
 
-CMD ["uvicorn", "report_pred_api.main:app", "--host", "0.0.0.0", "--port", "8002", "--workers", "2"]
+WORKDIR /app/report_pred_api
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8002", "--workers", "2"]
